@@ -34,6 +34,7 @@ def build_info() -> dict[str, object]:
     return {
         "available": bool(ext.is_available()),
         "cutlass_sm120_probe": bool(ext.cutlass_sm120_probe_compiled()),
+        "cutlass_mxfp8_mxfp4_probe": bool(ext.cutlass_mxfp8_mxfp4_probe_compiled()),
         "arch": ext.cutlass_sm120_probe_arch(),
     }
 

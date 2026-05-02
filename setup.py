@@ -36,6 +36,7 @@ def get_ext_modules():
             sources=[
                 "csrc/bindings.cpp",
                 "csrc/cutlass_sm120_probe.cu",
+                "csrc/cutlass_mxfp8_mxfp4_probe.cu",
             ],
             include_dirs=[
                 str(cutlass_path / "include"),

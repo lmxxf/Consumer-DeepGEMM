@@ -6,6 +6,7 @@
 
 bool cutlass_sm120_probe_compiled();
 std::string cutlass_sm120_probe_arch();
+bool cutlass_mxfp8_mxfp4_probe_compiled();
 
 namespace py = pybind11;
 
@@ -109,6 +110,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("is_available", []() { return true; });
   m.def("cutlass_sm120_probe_compiled", &cutlass_sm120_probe_compiled);
   m.def("cutlass_sm120_probe_arch", &cutlass_sm120_probe_arch);
+  m.def("cutlass_mxfp8_mxfp4_probe_compiled", &cutlass_mxfp8_mxfp4_probe_compiled);
   m.def(
       "m_grouped_fp8_fp4_gemm_nt_contiguous",
       &m_grouped_fp8_fp4_gemm_nt_contiguous_stub,

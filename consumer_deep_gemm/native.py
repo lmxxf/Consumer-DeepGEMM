@@ -39,6 +39,15 @@ def build_info() -> dict[str, object]:
     }
 
 
+def cutlass_mxfp8_mxfp4_can_implement_probe(a, b, d) -> bool | None:
+    ext = _load_native()
+    if ext is None or not hasattr(ext, "cutlass_mxfp8_mxfp4_can_implement_probe"):
+        return None
+    if not (getattr(a, "is_cuda", False) and getattr(b, "is_cuda", False) and getattr(d, "is_cuda", False)):
+        return None
+    return bool(ext.cutlass_mxfp8_mxfp4_can_implement_probe(a, b, d))
+
+
 def _first_tensor(value):
     if isinstance(value, tuple):
         return value[0]

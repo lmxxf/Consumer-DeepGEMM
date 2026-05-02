@@ -119,6 +119,10 @@ real CUDA tensors. The current native function intentionally returns `None`
 after validation, so Python falls back to the correctness implementation until
 the CUTLASS 79d kernel is wired in.
 
+It also checks the CUTLASS SM120 grouped `mx_float8 x mx_float4 -> bf16`
+`can_implement()` path on a small CUDA problem, proving the current work is past
+the type-only probe stage.
+
 Requires:
 - CUDA 12.8+
 - PyTorch 2.11+ with SM120 support

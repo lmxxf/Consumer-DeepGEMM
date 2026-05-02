@@ -5,6 +5,11 @@
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/group_array_problem_shape.hpp"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
+#include "cutlass/gemm/kernel/tile_scheduler_params.h"
+#include "cutlass/util/packed_stride.hpp"
+#include "torch/extension.h"
+
+#include <vector>
 
 namespace {
 
@@ -87,6 +92,127 @@ using GroupedGemmKernel = cutlass::gemm::kernel::GemmUniversal<
     GroupedCollectiveEpilogue>;
 
 using GroupedGemm = cutlass::gemm::device::GemmUniversalAdapter<GroupedGemmKernel>;
+using GroupedStrideA = typename GroupedGemm::GemmKernel::InternalStrideA;
+using GroupedStrideB = typename GroupedGemm::GemmKernel::InternalStrideB;
+using GroupedStrideC = typename GroupedGemm::GemmKernel::InternalStrideC;
+using GroupedStrideD = typename GroupedGemm::GemmKernel::InternalStrideD;
+using GroupedLayoutSFA = typename GroupedGemm::GemmKernel::CollectiveMainloop::InternalLayoutSFA;
+using GroupedLayoutSFB = typename GroupedGemm::GemmKernel::CollectiveMainloop::InternalLayoutSFB;
+
+typename GroupedGemm::Arguments make_grouped_arguments_probe() {
+  typename GroupedGemm::ElementA const** ptr_a = nullptr;
+  typename GroupedGemm::ElementB const** ptr_b = nullptr;
+  typename GroupedGemm::ElementC const** ptr_c = nullptr;
+  typename GroupedGemm::EpilogueOutputOp::ElementOutput** ptr_d = nullptr;
+  typename GroupedGemm::GemmKernel::CollectiveMainloop::ElementSF const** ptr_sfa = nullptr;
+  typename GroupedGemm::GemmKernel::CollectiveMainloop::ElementSF const** ptr_sfb = nullptr;
+
+  GroupProblemShape::UnderlyingProblemShape* problem_sizes = nullptr;
+  GroupedStrideA* stride_a = nullptr;
+  GroupedStrideB* stride_b = nullptr;
+  GroupedStrideC* stride_c = nullptr;
+  GroupedStrideD* stride_d = nullptr;
+  GroupedLayoutSFA* layout_sfa = nullptr;
+  GroupedLayoutSFB* layout_sfb = nullptr;
+
+  decltype(std::declval<typename GroupedGemm::Arguments>().epilogue.thread) fusion_args;
+  fusion_args.alpha = 1.0f;
+  fusion_args.beta = 0.0f;
+  fusion_args.alpha_ptr = nullptr;
+  fusion_args.beta_ptr = nullptr;
+  fusion_args.alpha_ptr_array = nullptr;
+  fusion_args.beta_ptr_array = nullptr;
+  fusion_args.dAlpha = {_0{}, _0{}, 0};
+  fusion_args.dBeta = {_0{}, _0{}, 0};
+
+  cutlass::KernelHardwareInfo hw_info;
+  hw_info.device_id = 0;
+  hw_info.sm_count = 1;
+
+  typename GroupedGemm::GemmKernel::TileSchedulerArguments scheduler;
+  scheduler.raster_order = cutlass::gemm::kernel::detail::RasterOrderOptions::AlongN;
+
+  return typename GroupedGemm::Arguments{
+      cutlass::gemm::GemmUniversalMode::kGrouped,
+      {0, problem_sizes, nullptr},
+      {ptr_a, stride_a, ptr_b, stride_b, ptr_sfa, layout_sfa, ptr_sfb, layout_sfb},
+      {fusion_args, ptr_c, stride_c, ptr_d, stride_d},
+      hw_info,
+      scheduler};
+}
+
+bool can_implement_grouped_probe(torch::Tensor a, torch::Tensor b, torch::Tensor d) {
+  const int groups = static_cast<int>(b.size(0));
+  const int m = static_cast<int>(a.size(0));
+  const int k = static_cast<int>(a.size(1));
+  const int n = static_cast<int>(b.size(1));
+
+  std::vector<GroupProblemShape::UnderlyingProblemShape> problem_sizes;
+  std::vector<GroupedStrideA> stride_a;
+  std::vector<GroupedStrideB> stride_b;
+  std::vector<GroupedStrideC> stride_c;
+  std::vector<GroupedStrideD> stride_d;
+  std::vector<GroupedLayoutSFA> layout_sfa;
+  std::vector<GroupedLayoutSFB> layout_sfb;
+
+  problem_sizes.reserve(groups);
+  stride_a.reserve(groups);
+  stride_b.reserve(groups);
+  stride_c.reserve(groups);
+  stride_d.reserve(groups);
+  layout_sfa.reserve(groups);
+  layout_sfb.reserve(groups);
+
+  for (int i = 0; i < groups; ++i) {
+    problem_sizes.push_back({m, n, k});
+    stride_a.push_back(cutlass::make_cute_packed_stride(GroupedStrideA{}, {m, k, 1}));
+    stride_b.push_back(cutlass::make_cute_packed_stride(GroupedStrideB{}, {n, k, 1}));
+    stride_c.push_back(cutlass::make_cute_packed_stride(GroupedStrideC{}, {m, n, 1}));
+    stride_d.push_back(cutlass::make_cute_packed_stride(GroupedStrideD{}, {m, n, 1}));
+    layout_sfa.push_back(
+        GroupedGemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig::
+            tile_atom_to_shape_SFA(cute::make_shape(m, n, k, 1)));
+    layout_sfb.push_back(
+        GroupedGemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig::
+            tile_atom_to_shape_SFB(cute::make_shape(m, n, k, 1)));
+  }
+
+  typename GroupedGemm::ElementA const** ptr_a = nullptr;
+  typename GroupedGemm::ElementB const** ptr_b = nullptr;
+  typename GroupedGemm::ElementC const** ptr_c = nullptr;
+  typename GroupedGemm::EpilogueOutputOp::ElementOutput** ptr_d = nullptr;
+  typename GroupedGemm::GemmKernel::CollectiveMainloop::ElementSF const** ptr_sfa = nullptr;
+  typename GroupedGemm::GemmKernel::CollectiveMainloop::ElementSF const** ptr_sfb = nullptr;
+
+  decltype(std::declval<typename GroupedGemm::Arguments>().epilogue.thread) fusion_args;
+  fusion_args.alpha = 1.0f;
+  fusion_args.beta = 0.0f;
+  fusion_args.alpha_ptr = nullptr;
+  fusion_args.beta_ptr = nullptr;
+  fusion_args.alpha_ptr_array = nullptr;
+  fusion_args.beta_ptr_array = nullptr;
+  fusion_args.dAlpha = {_0{}, _0{}, 0};
+  fusion_args.dBeta = {_0{}, _0{}, 0};
+
+  cutlass::KernelHardwareInfo hw_info;
+  hw_info.device_id = a.get_device();
+  hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
+
+  typename GroupedGemm::GemmKernel::TileSchedulerArguments scheduler;
+  scheduler.raster_order = cutlass::gemm::kernel::detail::RasterOrderOptions::AlongN;
+
+  typename GroupedGemm::Arguments arguments{
+      cutlass::gemm::GemmUniversalMode::kGrouped,
+      {groups, problem_sizes.data(), problem_sizes.data()},
+      {ptr_a, stride_a.data(), ptr_b, stride_b.data(),
+       ptr_sfa, layout_sfa.data(), ptr_sfb, layout_sfb.data()},
+      {fusion_args, ptr_c, stride_c.data(), ptr_d, stride_d.data()},
+      hw_info,
+      scheduler};
+
+  GroupedGemm gemm;
+  return gemm.can_implement(arguments) == cutlass::Status::kSuccess;
+}
 
 #endif
 
@@ -96,7 +222,16 @@ bool cutlass_mxfp8_mxfp4_probe_compiled() {
 #if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
   (void)sizeof(Gemm);
   (void)sizeof(GroupedGemm);
+  (void)sizeof(make_grouped_arguments_probe());
   return true;
+#else
+  return false;
+#endif
+}
+
+bool cutlass_mxfp8_mxfp4_can_implement_probe(torch::Tensor a, torch::Tensor b, torch::Tensor d) {
+#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+  return can_implement_grouped_probe(a, b, d);
 #else
   return false;
 #endif

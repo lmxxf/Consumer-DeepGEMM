@@ -50,5 +50,17 @@ def test_native_grouped_fp8_fp4_abi_returns_none_then_fallback_runs():
     assert torch.equal(d.cpu(), expected)
 
 
+def test_cutlass_mxfp8_mxfp4_grouped_can_implement_probe():
+    if not torch.cuda.is_available() or not native.is_available():
+        return
+
+    a = torch.empty((128, 128), device="cuda", dtype=torch.float8_e4m3fn)
+    b = torch.empty((2, 128, 64), device="cuda", dtype=torch.int8)
+    d = torch.empty((128, 128), device="cuda", dtype=torch.bfloat16)
+
+    assert native.cutlass_mxfp8_mxfp4_can_implement_probe(a, b, d) is True
+
+
 if __name__ == "__main__":
     test_native_grouped_fp8_fp4_abi_returns_none_then_fallback_runs()
+    test_cutlass_mxfp8_mxfp4_grouped_can_implement_probe()

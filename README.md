@@ -48,6 +48,25 @@ Implements the DeepGEMM functions used by vLLM for DeepSeek V4 inference:
 pip install -e .
 ```
 
+Default install uses the Python fallback only. To build the CUTLASS native
+extension inside the DGX Spark/vLLM container:
+
+```bash
+CONSUMER_DEEP_GEMM_BUILD_CUDA=1 \
+CONSUMER_DEEP_GEMM_CUDA_ARCH=120a \
+CUTLASS_PATH=/home/lmxxf/work/deepseek-v4-flash-deployment/DeepGEMM/third-party/cutlass \
+pip install -e .
+```
+
+For native extension smoke-test:
+
+```bash
+python - <<'PY'
+import consumer_deep_gemm as dg
+print(dg.native_build_info())
+PY
+```
+
 Requires:
 - CUDA 12.8+
 - PyTorch 2.11+ with SM120 support

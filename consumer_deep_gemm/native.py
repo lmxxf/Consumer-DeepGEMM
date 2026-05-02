@@ -38,8 +38,21 @@ def build_info() -> dict[str, object]:
     }
 
 
+def _first_tensor(value):
+    if isinstance(value, tuple):
+        return value[0]
+    return value
+
+
 def m_grouped_fp8_fp4_gemm_nt_contiguous(*args, **kwargs):
     ext = _load_native()
     if ext is None or not hasattr(ext, "m_grouped_fp8_fp4_gemm_nt_contiguous"):
+        return None
+    if len(args) < 3:
+        return None
+    a = _first_tensor(args[0])
+    b = _first_tensor(args[1])
+    d = args[2]
+    if not (getattr(a, "is_cuda", False) and getattr(b, "is_cuda", False) and getattr(d, "is_cuda", False)):
         return None
     return ext.m_grouped_fp8_fp4_gemm_nt_contiguous(*args, **kwargs)

@@ -104,6 +104,21 @@ vllm.third_party.deep_gemm: {'available': True, 'cutlass_sm120_probe': True, 'ar
 The installer handles Docker bind-mount ownership by adding the project path to
 Git's `safe.directory` list before `pip install -e .`.
 
+Native ABI smoke-test with GPU access:
+
+```bash
+docker run --rm --gpus all \
+  -v /home/lmxxf/work/deepseek-v4-flash-deployment:/work \
+  -w /work/Consumer-DeepGEMM \
+  vllm-node-sm120:latest \
+  bash -lc './scripts/build_native_sm120.sh >/tmp/build.log && PYTHONPATH=/work/Consumer-DeepGEMM python3 tests/test_native_abi.py'
+```
+
+This validates the Python -> `_C.m_grouped_fp8_fp4_gemm_nt_contiguous` ABI with
+real CUDA tensors. The current native function intentionally returns `None`
+after validation, so Python falls back to the correctness implementation until
+the CUTLASS 79d kernel is wired in.
+
 Requires:
 - CUDA 12.8+
 - PyTorch 2.11+ with SM120 support

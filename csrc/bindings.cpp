@@ -7,6 +7,7 @@
 bool cutlass_sm120_probe_compiled();
 std::string cutlass_sm120_probe_arch();
 bool cutlass_mxfp8_mxfp4_probe_compiled();
+bool cutlass_mxfp8_mxfp4_can_implement_probe(torch::Tensor a, torch::Tensor b, torch::Tensor d);
 
 namespace py = pybind11;
 
@@ -111,6 +112,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("cutlass_sm120_probe_compiled", &cutlass_sm120_probe_compiled);
   m.def("cutlass_sm120_probe_arch", &cutlass_sm120_probe_arch);
   m.def("cutlass_mxfp8_mxfp4_probe_compiled", &cutlass_mxfp8_mxfp4_probe_compiled);
+  m.def("cutlass_mxfp8_mxfp4_can_implement_probe", &cutlass_mxfp8_mxfp4_can_implement_probe);
   m.def(
       "m_grouped_fp8_fp4_gemm_nt_contiguous",
       &m_grouped_fp8_fp4_gemm_nt_contiguous_stub,

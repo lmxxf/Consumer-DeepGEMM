@@ -21,5 +21,7 @@ PYTHON_BIN="${PYTHON_BIN:-$(command -v python3 || command -v python)}"
 "${PYTHON_BIN}" setup.py build_ext --inplace
 "${PYTHON_BIN}" - <<'PY'
 import consumer_deep_gemm as dg
+import deep_gemm
 print(dg.native_build_info())
+print("deep_gemm shim:", deep_gemm.__name__)
 PY

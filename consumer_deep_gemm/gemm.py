@@ -60,6 +60,8 @@ def _dequant_fp4_block(x: torch.Tensor, scale: Optional[torch.Tensor], block_k: 
     """
     if x.dtype in (torch.bfloat16, torch.float16, torch.float32):
         return x.to(torch.bfloat16)
+    if x.dtype == torch.int8:
+        x = x.view(torch.uint8)
     if x.dtype != torch.uint8:
         return x.to(torch.bfloat16)
 
@@ -177,6 +179,87 @@ def fp8_fp4_gemm_nn(a, b, d, c=None, **kwargs):
     d.copy_(result)
 
 
+def _dequant_fp8_arg(a) -> torch.Tensor:
+    if isinstance(a, tuple):
+        a_tensor, a_scale = a
+        return _dequant_fp8_block(a_tensor, a_scale)
+    return a.to(torch.bfloat16)
+
+
+def _dequant_fp4_arg(b) -> torch.Tensor:
+    if isinstance(b, tuple):
+        b_tensor, b_scale = b
+        return _dequant_fp4_block(b_tensor, b_scale)
+    return b.to(torch.bfloat16)
+
+
+def _grouped_segments_from_indices(m_indices: Optional[torch.Tensor], m: int, num_groups: int):
+    """Return row indices per group for DeepGEMM contiguous grouped layout.
+
+    DeepGEMM uses either a per-row group-id vector (normal contiguous layout)
+    or a cumulative-end vector (psum layout). The per-row layout is the one
+    vLLM uses for MoE routing; psum is kept as a correctness fallback.
+    """
+    if m_indices is None:
+        if num_groups != 1:
+            raise ValueError("m_indices is required when b has multiple groups")
+        return [torch.arange(m)]
+
+    if m_indices.numel() == m:
+        return [(m_indices == group).nonzero(as_tuple=False).flatten() for group in range(num_groups)]
+
+    if m_indices.numel() == num_groups:
+        ends = m_indices.to("cpu", non_blocking=False).tolist()
+        starts = [0] + [int(end) for end in ends[:-1]]
+        return [
+            torch.arange(start, int(end), device=m_indices.device)
+            for start, end in zip(starts, ends)
+        ]
+
+    raise ValueError(
+        f"m_indices must have length M ({m}) or num_groups ({num_groups}), "
+        f"got {m_indices.numel()}"
+    )
+
+
+def _select_group_weight_nt(b_group: torch.Tensor, k: int) -> torch.Tensor:
+    """Normalize a grouped B slice to [N, K] for NT matmul."""
+    if b_group.dim() != 2:
+        raise ValueError(f"grouped B slice must be 2D, got shape {tuple(b_group.shape)}")
+    if b_group.shape[-1] == k:
+        return b_group
+    if b_group.shape[0] == k:
+        return b_group.t().contiguous()
+    raise ValueError(f"cannot infer B layout for shape {tuple(b_group.shape)} and K={k}")
+
+
+def _m_grouped_fp8_fp4_fallback_nt(a, b, d, m_indices=None):
+    a_deq = _dequant_fp8_arg(a)
+    b_deq = _dequant_fp4_arg(b)
+
+    if b_deq.dim() == 2:
+        result = torch.mm(a_deq.to(torch.float32), b_deq.to(torch.float32).t())
+        d.copy_(result)
+        return
+
+    if b_deq.dim() != 3:
+        raise ValueError(f"grouped B must be 2D or 3D, got shape {tuple(b_deq.shape)}")
+
+    m, k = a_deq.shape
+    num_groups = b_deq.shape[0]
+    d.zero_()
+    for group, rows in enumerate(_grouped_segments_from_indices(m_indices, m, num_groups)):
+        if rows.numel() == 0:
+            continue
+        rows = rows.to(device=a_deq.device)
+        b_group = _select_group_weight_nt(b_deq[group], k)
+        result = torch.mm(
+            a_deq.index_select(0, rows).to(torch.float32),
+            b_group.to(torch.float32).t(),
+        )
+        d.index_copy_(0, rows, result.to(d.dtype))
+
+
 def m_grouped_fp8_gemm_nt_contiguous(a, sfa, b, sfb, d, m_indices=None, **kwargs):
     """M-grouped FP8 GEMM for MoE contiguous layout."""
     fp8_gemm_nt(a, sfa, b, sfb, d, **kwargs)
@@ -193,7 +276,7 @@ def m_grouped_fp8_fp4_gemm_nt_contiguous(a, b, d, m_indices=None, **kwargs):
     )
     if native_result is not None:
         return native_result
-    fp8_fp4_gemm_nt(a, b, d, **kwargs)
+    _m_grouped_fp8_fp4_fallback_nt(a, b, d, m_indices)
 
 
 def m_grouped_fp8_fp4_gemm_nn_contiguous(a, b, d, m_indices=None, **kwargs):

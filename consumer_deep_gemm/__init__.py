@@ -34,9 +34,16 @@ from .layout import (
     transform_sf_into_required_layout,
     get_mn_major_tma_aligned_tensor,
     get_mk_alignment_for_contiguous_layout,
+    set_mk_alignment_for_contiguous_layout,
+    get_theoretical_mk_alignment_for_contiguous_layout,
 )
 from .utils import set_num_sms, get_num_sms, set_tc_util, get_tc_util
 from .native import build_info as native_build_info, is_available as native_is_available
+from .mega import (
+    get_symm_buffer_for_mega_moe,
+    transform_weights_for_mega_moe,
+    fp8_fp4_mega_moe,
+)
 
 # Legacy aliases
 fp8_m_grouped_gemm_nt_masked = m_grouped_fp8_gemm_nt_masked

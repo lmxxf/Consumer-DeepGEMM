@@ -67,6 +67,43 @@ print(dg.native_build_info())
 PY
 ```
 
+Inside the `vllm-node-sm120` container, use the one-shot installer:
+
+```bash
+cd /work/Consumer-DeepGEMM
+./scripts/install_in_vllm_container.sh
+```
+
+That does three things:
+
+- installs this package in editable mode, including the top-level `deep_gemm`
+  compatibility package
+- builds `consumer_deep_gemm._C` for `sm_120a`
+- writes `vllm.third_party.deep_gemm` as a shim to `consumer_deep_gemm`, because
+  DeepSeek V4 MegaMoE currently imports that hard-coded vendored path
+- patches installed vLLM's DeepGEMM support checks to allow SM120/SM121 instead
+  of only SM90/SM100
+
+Host-side Docker smoke-test:
+
+```bash
+docker run --rm \
+  -v /home/lmxxf/work/deepseek-v4-flash-deployment:/work \
+  -w /work/Consumer-DeepGEMM \
+  vllm-node-sm120:latest \
+  bash -lc './scripts/install_in_vllm_container.sh'
+```
+
+Expected probe output:
+
+```text
+deep_gemm: {'available': True, 'cutlass_sm120_probe': True, 'arch': 'sm_121a'}
+vllm.third_party.deep_gemm: {'available': True, 'cutlass_sm120_probe': True, 'arch': 'sm_121a'}
+```
+
+The installer handles Docker bind-mount ownership by adding the project path to
+Git's `safe.directory` list before `pip install -e .`.
+
 Requires:
 - CUDA 12.8+
 - PyTorch 2.11+ with SM120 support

@@ -1,7 +1,6 @@
 """Scale factor layout transforms matching DeepGEMM's API."""
 
 import torch
-from typing import Optional, List
 
 
 def transform_sf_into_required_layout(
@@ -25,6 +24,18 @@ def get_mn_major_tma_aligned_tensor(x: torch.Tensor) -> torch.Tensor:
     return x.contiguous()
 
 
-def get_mk_alignment_for_contiguous_layout() -> List[int]:
+_mk_alignment_for_contiguous_layout = 1
+
+
+def get_mk_alignment_for_contiguous_layout() -> int:
     """Return MK alignment requirements for contiguous grouped GEMM layout."""
-    return [1, 1]
+    return _mk_alignment_for_contiguous_layout
+
+
+def set_mk_alignment_for_contiguous_layout(alignment: int) -> None:
+    global _mk_alignment_for_contiguous_layout
+    _mk_alignment_for_contiguous_layout = int(alignment)
+
+
+def get_theoretical_mk_alignment_for_contiguous_layout(*args, **kwargs) -> int:
+    return 1

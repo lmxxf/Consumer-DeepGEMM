@@ -29,6 +29,53 @@ PATCHES = {
             "            )",
         ),
     ],
+    "model_executor/kernels/linear/scaled_mm/deep_gemm.py": [
+        (
+            "        if not is_deep_gemm_supported():\n"
+            "            return False, \"Currently, only Hopper and Blackwell GPUs are supported.\"\n"
+            "        return True, None",
+            "        if current_platform.is_device_capability_family(120):\n"
+            "            return False, (\n"
+            "                \"Consumer-DeepGEMM on SM120/SM121 is only enabled for \"\n"
+            "                \"DeepSeek V4 MoE FP4; ordinary FP8 linear should use the \"\n"
+            "                \"non-DeepGEMM vLLM kernels.\"\n"
+            "            )\n"
+            "        if not is_deep_gemm_supported():\n"
+            "            return False, \"Currently, only Hopper and Blackwell GPUs are supported.\"\n"
+            "        return True, None",
+        ),
+        (
+            "        if config.out_dtype != torch.bfloat16:\n"
+            "            return (False, \"Supports only output dtype of bfloat16\")",
+            "        if current_platform.is_device_capability_family(120):\n"
+            "            return False, (\n"
+            "                \"Consumer-DeepGEMM on SM120/SM121 is only enabled for \"\n"
+            "                \"DeepSeek V4 MoE FP4; ordinary FP8 linear should use the \"\n"
+            "                \"non-DeepGEMM vLLM kernels.\"\n"
+            "            )\n"
+            "        if config.out_dtype != torch.bfloat16:\n"
+            "            return (False, \"Supports only output dtype of bfloat16\")",
+        ),
+    ],
+    "model_executor/warmup/deep_gemm_warmup.py": [
+        (
+            "from vllm.tracing import instrument\n"
+            "from vllm.utils.deep_gemm import (",
+            "from vllm.tracing import instrument\n"
+            "from vllm.platforms import current_platform\n"
+            "from vllm.utils.deep_gemm import (",
+        ),
+        (
+            "    # FIXME: this logic is brittle and incorrect - since we\n"
+            "    # could use DeepGEMM with for than just Fp8LinearMethod\n"
+            "    block_size = get_mk_alignment_for_contiguous_layout()[0]",
+            "    if current_platform.is_device_capability_family(120):\n"
+            "        return False\n\n"
+            "    # FIXME: this logic is brittle and incorrect - since we\n"
+            "    # could use DeepGEMM with for than just Fp8LinearMethod\n"
+            "    block_size = get_mk_alignment_for_contiguous_layout()[0]",
+        ),
+    ],
 }
 
 

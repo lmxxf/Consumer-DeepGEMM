@@ -3,11 +3,20 @@
 #include <pybind11/pybind11.h>
 
 #include <string>
+#include <vector>
 
 bool cutlass_sm120_probe_compiled();
 std::string cutlass_sm120_probe_arch();
 bool cutlass_mxfp8_mxfp4_probe_compiled();
 bool cutlass_mxfp8_mxfp4_can_implement_probe(torch::Tensor a, torch::Tensor b, torch::Tensor d);
+std::vector<int64_t> cutlass_mxfp8_mxfp4_scale_layout_sizes(int64_t m, int64_t n, int64_t k);
+bool cutlass_mxfp8_mxfp4_grouped_launch(
+    torch::Tensor a,
+    torch::Tensor a_scale,
+    torch::Tensor b,
+    torch::Tensor b_scale,
+    torch::Tensor d,
+    torch::Tensor m_indices);
 
 namespace py = pybind11;
 
@@ -100,9 +109,17 @@ py::object m_grouped_fp8_fp4_gemm_nt_contiguous_stub(
   auto [b, b_scale] = tensor_scale_pair_from_object(b_obj, "b");
   check_grouped_fp8_fp4_shapes(a, a_scale, b, b_scale, d, m_indices);
 
-  // ABI is wired. Returning None lets Python use the correctness fallback until
-  // the CUTLASS 79d SM120 grouped FP4 kernel is connected here.
-  return py::none();
+  if (a.scalar_type() != torch::kFloat8_e4m3fn || d.scalar_type() != torch::kBFloat16 ||
+      m_indices.is_none()) {
+    return py::none();
+  }
+
+  auto indices = tensor_from_object(m_indices, "m_indices");
+  const bool launched = cutlass_mxfp8_mxfp4_grouped_launch(a, a_scale, b, b_scale, d, indices);
+  if (!launched) {
+    return py::none();
+  }
+  return py::bool_(true);
 }
 
 }  // namespace
@@ -113,6 +130,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("cutlass_sm120_probe_arch", &cutlass_sm120_probe_arch);
   m.def("cutlass_mxfp8_mxfp4_probe_compiled", &cutlass_mxfp8_mxfp4_probe_compiled);
   m.def("cutlass_mxfp8_mxfp4_can_implement_probe", &cutlass_mxfp8_mxfp4_can_implement_probe);
+  m.def("cutlass_mxfp8_mxfp4_scale_layout_sizes", &cutlass_mxfp8_mxfp4_scale_layout_sizes);
   m.def(
       "m_grouped_fp8_fp4_gemm_nt_contiguous",
       &m_grouped_fp8_fp4_gemm_nt_contiguous_stub,

@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 export CONSUMER_DEEP_GEMM_BUILD_CUDA=1
-export CONSUMER_DEEP_GEMM_CUDA_ARCH="${CONSUMER_DEEP_GEMM_CUDA_ARCH:-120a}"
+export CONSUMER_DEEP_GEMM_CUDA_ARCH="${CONSUMER_DEEP_GEMM_CUDA_ARCH:-121a}"
 if [[ -z "${CUTLASS_PATH:-}" ]]; then
   if [[ -d ../DeepGEMM/third-party/cutlass ]]; then
     export CUTLASS_PATH="$(realpath ../DeepGEMM/third-party/cutlass)"

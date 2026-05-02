@@ -35,13 +35,19 @@ def _dequant_fp8_block(x: torch.Tensor, scale: torch.Tensor, block_k: int = 128)
     orig_shape = x.shape
     M, K = orig_shape[0], orig_shape[1]
     n_blocks = (K + block_k - 1) // block_k
+    pad = n_blocks * block_k - K
 
+    if pad:
+        x = torch.nn.functional.pad(x, (0, pad))
     x_f = x.reshape(M, n_blocks, block_k).to(torch.bfloat16)
     s = scale.to(torch.float32)
     if s.dim() == 2 and s.shape[1] == n_blocks:
         s = s.unsqueeze(2)
     x_f = x_f * s.to(torch.bfloat16)
-    return x_f.reshape(orig_shape).to(torch.bfloat16)
+    out = x_f.reshape(M, n_blocks * block_k)
+    if pad:
+        out = out[:, :K]
+    return out.reshape(orig_shape).to(torch.bfloat16)
 
 
 def _e8m0_to_float(scale: torch.Tensor) -> torch.Tensor:
@@ -49,6 +55,42 @@ def _e8m0_to_float(scale: torch.Tensor) -> torch.Tensor:
     if scale.dtype == torch.uint8:
         return torch.pow(2.0, scale.to(torch.float32) - 127.0)
     return scale.to(torch.float32)
+
+
+def _float_scale_to_e8m0(scale: torch.Tensor) -> torch.Tensor:
+    """Convert positive float scales to E8M0 bytes for CUTLASS MX kernels."""
+    if scale.dtype == torch.uint8:
+        return scale.contiguous()
+    scale_f = scale.to(torch.float32)
+    tiny = torch.finfo(torch.float32).tiny
+    e8m0 = torch.ceil(torch.log2(torch.clamp(scale_f, min=tiny))) + 127.0
+    return torch.clamp(e8m0, 0, 255).to(torch.uint8).contiguous()
+
+
+def _expand_a_scale_for_cutlass_mx(scale: torch.Tensor) -> torch.Tensor:
+    """Expand per-128-K activation scales to CUTLASS SM120 SFA layout.
+
+    vLLM/DeepGEMM's MoE scatter produces activation scales as [M, K / 128].
+    CUTLASS' SM120 block-scaled MX mainloop stores four scale atoms per
+    logical activation scale in the SFA layout used by 72c/79c.
+    """
+    if scale.dim() == 2:
+        return scale.repeat_interleave(4, dim=1).contiguous()
+    return scale.contiguous()
+
+
+def _native_mxfp8_mxfp4_args(a, b):
+    if not (isinstance(a, tuple) and isinstance(b, tuple)):
+        return a, b
+    a_tensor, a_scale = a
+    b_tensor, b_scale = b
+    return (
+        a_tensor,
+        _expand_a_scale_for_cutlass_mx(_float_scale_to_e8m0(a_scale)),
+    ), (
+        b_tensor,
+        _float_scale_to_e8m0(b_scale),
+    )
 
 
 def _dequant_fp4_block(x: torch.Tensor, scale: Optional[torch.Tensor], block_k: int = 32) -> torch.Tensor:
@@ -103,8 +145,22 @@ def _gemm_fallback(a: torch.Tensor, b: torch.Tensor, transpose_b: bool = True) -
     return torch.mm(a_f, b_f).to(torch.bfloat16)
 
 
-def fp8_gemm_nt(a, sfa, b, sfb, d, c=None, **kwargs):
+def _normalize_fp8_gemm_args(a, sfa, b=None, sfb=None, d=None):
+    """Accept both DeepGEMM and vLLM tuple-form FP8 GEMM arguments."""
+    if isinstance(a, tuple) and isinstance(sfa, tuple):
+        if b is None:
+            raise TypeError("tuple-form fp8_gemm_nt requires output tensor")
+        a_tensor, a_scale = a
+        b_tensor, b_scale = sfa
+        return a_tensor, a_scale, b_tensor, b_scale, b
+    if b is None or sfb is None or d is None:
+        raise TypeError("fp8_gemm_nt requires (a, sfa, b, sfb, d)")
+    return a, sfa, b, sfb, d
+
+
+def fp8_gemm_nt(a, sfa, b=None, sfb=None, d=None, c=None, **kwargs):
     """FP8 GEMM: D = A @ B^T, with per-block scale factors."""
+    a, sfa, b, sfb, d = _normalize_fp8_gemm_args(a, sfa, b, sfb, d)
     a_deq = _dequant_fp8_block(a, sfa)
     b_deq = _dequant_fp8_block(b, sfb)
     result = torch.mm(a_deq.to(torch.float32), b_deq.to(torch.float32).t())
@@ -271,11 +327,12 @@ def m_grouped_fp8_gemm_nn_contiguous(a, sfa, b, sfb, d, m_indices=None, **kwargs
 
 def m_grouped_fp8_fp4_gemm_nt_contiguous(a, b, d, m_indices=None, **kwargs):
     """M-grouped FP8×FP4 GEMM for MoE contiguous layout."""
+    native_a, native_b = _native_mxfp8_mxfp4_args(a, b)
     native_result = native.m_grouped_fp8_fp4_gemm_nt_contiguous(
-        a, b, d, m_indices, **kwargs
+        native_a, native_b, d, m_indices, **kwargs
     )
     if native_result is not None:
-        return native_result
+        return
     _m_grouped_fp8_fp4_fallback_nt(a, b, d, m_indices)
 
 

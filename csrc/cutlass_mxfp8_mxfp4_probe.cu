@@ -7,8 +7,11 @@
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
 #include "cutlass/gemm/kernel/tile_scheduler_params.h"
 #include "cutlass/util/packed_stride.hpp"
+#include "c10/cuda/CUDAStream.h"
 #include "torch/extension.h"
 
+#include <cstdint>
+#include <cstring>
 #include <vector>
 
 namespace {
@@ -214,6 +217,223 @@ bool can_implement_grouped_probe(torch::Tensor a, torch::Tensor b, torch::Tensor
   return gemm.can_implement(arguments) == cutlass::Status::kSuccess;
 }
 
+template <typename T>
+torch::Tensor device_copy_from_host(std::vector<T> const& values, torch::Device device) {
+  auto options = torch::TensorOptions().device(torch::kCPU).dtype(torch::kUInt8);
+  auto host = torch::empty({static_cast<int64_t>(values.size() * sizeof(T))}, options);
+  std::memcpy(host.data_ptr(), values.data(), values.size() * sizeof(T));
+  return host.to(device, /*non_blocking=*/false);
+}
+
+torch::Tensor pointer_array_from_host(std::vector<uintptr_t> const& values, torch::Device device) {
+  auto host = torch::empty({static_cast<int64_t>(values.size())}, torch::TensorOptions().device(torch::kCPU).dtype(torch::kInt64));
+  auto* out = host.data_ptr<int64_t>();
+  for (size_t i = 0; i < values.size(); ++i) {
+    out[i] = static_cast<int64_t>(values[i]);
+  }
+  return host.to(device, /*non_blocking=*/false);
+}
+
+struct GroupSegment {
+  int group;
+  int start;
+  int count;
+};
+
+std::vector<GroupSegment> segments_from_indices(torch::Tensor m_indices, int m, int groups) {
+  auto cpu = m_indices.to(torch::kCPU, /*non_blocking=*/false).contiguous();
+  std::vector<int64_t> vals(cpu.numel());
+  if (cpu.scalar_type() == torch::kInt32) {
+    auto* p = cpu.data_ptr<int32_t>();
+    for (int64_t i = 0; i < cpu.numel(); ++i) {
+      vals[i] = p[i];
+    }
+  } else if (cpu.scalar_type() == torch::kInt64) {
+    auto* p = cpu.data_ptr<int64_t>();
+    for (int64_t i = 0; i < cpu.numel(); ++i) {
+      vals[i] = p[i];
+    }
+  } else {
+    return {};
+  }
+
+  std::vector<GroupSegment> out;
+  if (static_cast<int>(vals.size()) == groups) {
+    int start = 0;
+    for (int group = 0; group < groups; ++group) {
+      int end = static_cast<int>(vals[group]);
+      if (end < start || end > m) {
+        return {};
+      }
+      if (end > start) {
+        out.push_back({group, start, end - start});
+      }
+      start = end;
+    }
+    return out;
+  }
+
+  if (static_cast<int>(vals.size()) != m) {
+    return {};
+  }
+
+  for (int group = 0; group < groups; ++group) {
+    int start = -1;
+    int count = 0;
+    bool closed = false;
+    for (int row = 0; row < m; ++row) {
+      if (vals[row] == group) {
+        if (closed) {
+          return {};
+        }
+        if (start < 0) {
+          start = row;
+        }
+        ++count;
+      } else if (start >= 0) {
+        closed = true;
+      } else if (vals[row] < -1 || vals[row] >= groups) {
+        return {};
+      }
+    }
+    if (count > 0) {
+      out.push_back({group, start, count});
+    }
+  }
+  return out;
+}
+
+bool launch_grouped_fp8_fp4(torch::Tensor a, torch::Tensor a_scale, torch::Tensor b,
+                            torch::Tensor b_scale, torch::Tensor d, torch::Tensor m_indices) {
+  const int groups = static_cast<int>(b.size(0));
+  const int m = static_cast<int>(a.size(0));
+  const int k = static_cast<int>(a.size(1));
+  const int n = static_cast<int>(b.size(1));
+  auto segments = segments_from_indices(m_indices, m, groups);
+  if (segments.empty()) {
+    return false;
+  }
+
+  std::vector<GroupProblemShape::UnderlyingProblemShape> problem_sizes;
+  std::vector<GroupedStrideA> stride_a;
+  std::vector<GroupedStrideB> stride_b;
+  std::vector<GroupedStrideC> stride_c;
+  std::vector<GroupedStrideD> stride_d;
+  std::vector<GroupedLayoutSFA> layout_sfa;
+  std::vector<GroupedLayoutSFB> layout_sfb;
+  std::vector<uintptr_t> ptr_a;
+  std::vector<uintptr_t> ptr_b;
+  std::vector<uintptr_t> ptr_c;
+  std::vector<uintptr_t> ptr_d;
+  std::vector<uintptr_t> ptr_sfa;
+  std::vector<uintptr_t> ptr_sfb;
+
+  const int64_t a_row_stride = a.stride(0);
+  const int64_t d_row_stride = d.stride(0);
+  const int64_t b_group_stride = b.stride(0);
+  const int64_t b_scale_group_stride = b_scale.dim() > 0 ? b_scale.stride(0) : 0;
+  const int64_t a_scale_row_stride = a_scale.dim() > 0 ? a_scale.stride(0) : 0;
+
+  auto* a_base = reinterpret_cast<uint8_t*>(a.data_ptr());
+  auto* b_base = reinterpret_cast<uint8_t*>(b.data_ptr());
+  auto* d_base = reinterpret_cast<uint8_t*>(d.data_ptr());
+  auto* a_scale_base = reinterpret_cast<uint8_t*>(a_scale.data_ptr());
+  auto* b_scale_base = reinterpret_cast<uint8_t*>(b_scale.data_ptr());
+
+  for (auto const& seg : segments) {
+    problem_sizes.push_back({seg.count, n, k});
+    stride_a.push_back(cutlass::make_cute_packed_stride(GroupedStrideA{}, {seg.count, k, 1}));
+    stride_b.push_back(cutlass::make_cute_packed_stride(GroupedStrideB{}, {n, k, 1}));
+    stride_c.push_back(cutlass::make_cute_packed_stride(GroupedStrideC{}, {seg.count, n, 1}));
+    stride_d.push_back(cutlass::make_cute_packed_stride(GroupedStrideD{}, {seg.count, n, 1}));
+    layout_sfa.push_back(
+        GroupedGemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig::
+            tile_atom_to_shape_SFA(cute::make_shape(seg.count, n, k, 1)));
+    layout_sfb.push_back(
+        GroupedGemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig::
+            tile_atom_to_shape_SFB(cute::make_shape(seg.count, n, k, 1)));
+
+    ptr_a.push_back(reinterpret_cast<uintptr_t>(a_base + seg.start * a_row_stride * a.element_size()));
+    ptr_b.push_back(reinterpret_cast<uintptr_t>(b_base + seg.group * b_group_stride * b.element_size()));
+    ptr_c.push_back(0);
+    ptr_d.push_back(reinterpret_cast<uintptr_t>(d_base + seg.start * d_row_stride * d.element_size()));
+    ptr_sfa.push_back(reinterpret_cast<uintptr_t>(a_scale_base + seg.start * a_scale_row_stride * a_scale.element_size()));
+    ptr_sfb.push_back(reinterpret_cast<uintptr_t>(b_scale_base + seg.group * b_scale_group_stride * b_scale.element_size()));
+  }
+
+  const int active = static_cast<int>(segments.size());
+  auto device = a.device();
+  auto problem_sizes_dev = device_copy_from_host(problem_sizes, device);
+  auto stride_a_dev = device_copy_from_host(stride_a, device);
+  auto stride_b_dev = device_copy_from_host(stride_b, device);
+  auto stride_c_dev = device_copy_from_host(stride_c, device);
+  auto stride_d_dev = device_copy_from_host(stride_d, device);
+  auto layout_sfa_dev = device_copy_from_host(layout_sfa, device);
+  auto layout_sfb_dev = device_copy_from_host(layout_sfb, device);
+  auto ptr_a_dev = pointer_array_from_host(ptr_a, device);
+  auto ptr_b_dev = pointer_array_from_host(ptr_b, device);
+  auto ptr_c_dev = pointer_array_from_host(ptr_c, device);
+  auto ptr_d_dev = pointer_array_from_host(ptr_d, device);
+  auto ptr_sfa_dev = pointer_array_from_host(ptr_sfa, device);
+  auto ptr_sfb_dev = pointer_array_from_host(ptr_sfb, device);
+
+  decltype(std::declval<typename GroupedGemm::Arguments>().epilogue.thread) fusion_args;
+  fusion_args.alpha = 1.0f;
+  fusion_args.beta = 0.0f;
+  fusion_args.alpha_ptr = nullptr;
+  fusion_args.beta_ptr = nullptr;
+  fusion_args.alpha_ptr_array = nullptr;
+  fusion_args.beta_ptr_array = nullptr;
+  fusion_args.dAlpha = {_0{}, _0{}, 0};
+  fusion_args.dBeta = {_0{}, _0{}, 0};
+
+  cutlass::KernelHardwareInfo hw_info;
+  hw_info.device_id = a.get_device();
+  hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
+
+  typename GroupedGemm::GemmKernel::TileSchedulerArguments scheduler;
+  scheduler.raster_order = cutlass::gemm::kernel::detail::RasterOrderOptions::AlongN;
+
+  typename GroupedGemm::Arguments arguments{
+      cutlass::gemm::GemmUniversalMode::kGrouped,
+      {active,
+       reinterpret_cast<GroupProblemShape::UnderlyingProblemShape*>(problem_sizes_dev.data_ptr()),
+       problem_sizes.data()},
+      {reinterpret_cast<typename GroupedGemm::ElementA const**>(ptr_a_dev.data_ptr<int64_t>()),
+       reinterpret_cast<GroupedStrideA*>(stride_a_dev.data_ptr()),
+       reinterpret_cast<typename GroupedGemm::ElementB const**>(ptr_b_dev.data_ptr<int64_t>()),
+       reinterpret_cast<GroupedStrideB*>(stride_b_dev.data_ptr()),
+       reinterpret_cast<typename GroupedGemm::GemmKernel::CollectiveMainloop::ElementSF const**>(ptr_sfa_dev.data_ptr<int64_t>()),
+       reinterpret_cast<GroupedLayoutSFA*>(layout_sfa_dev.data_ptr()),
+       reinterpret_cast<typename GroupedGemm::GemmKernel::CollectiveMainloop::ElementSF const**>(ptr_sfb_dev.data_ptr<int64_t>()),
+       reinterpret_cast<GroupedLayoutSFB*>(layout_sfb_dev.data_ptr())},
+      {fusion_args,
+       reinterpret_cast<typename GroupedGemm::ElementC const**>(ptr_c_dev.data_ptr<int64_t>()),
+       reinterpret_cast<GroupedStrideC*>(stride_c_dev.data_ptr()),
+       reinterpret_cast<typename GroupedGemm::EpilogueOutputOp::ElementOutput**>(ptr_d_dev.data_ptr<int64_t>()),
+       reinterpret_cast<GroupedStrideD*>(stride_d_dev.data_ptr())},
+      hw_info,
+      scheduler};
+
+  GroupedGemm gemm;
+  if (gemm.can_implement(arguments) != cutlass::Status::kSuccess) {
+    return false;
+  }
+
+  d.zero_();
+  const size_t workspace_size = GroupedGemm::get_workspace_size(arguments);
+  auto workspace = torch::empty({static_cast<int64_t>(workspace_size)},
+                                torch::TensorOptions().device(device).dtype(torch::kUInt8));
+  void* workspace_ptr = workspace_size == 0 ? nullptr : workspace.data_ptr();
+  auto stream = c10::cuda::getCurrentCUDAStream(a.get_device()).stream();
+  auto status = gemm.initialize(arguments, workspace_ptr, stream);
+  if (status != cutlass::Status::kSuccess) {
+    return false;
+  }
+  status = gemm.run(stream);
+  return status == cutlass::Status::kSuccess;
+}
+
 #endif
 
 }  // namespace
@@ -232,6 +452,37 @@ bool cutlass_mxfp8_mxfp4_probe_compiled() {
 bool cutlass_mxfp8_mxfp4_can_implement_probe(torch::Tensor a, torch::Tensor b, torch::Tensor d) {
 #if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
   return can_implement_grouped_probe(a, b, d);
+#else
+  return false;
+#endif
+}
+
+std::vector<int64_t> cutlass_mxfp8_mxfp4_scale_layout_sizes(int64_t m, int64_t n, int64_t k) {
+#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+  auto layout_sfa =
+      GroupedGemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig::
+          tile_atom_to_shape_SFA(cute::make_shape(static_cast<int>(m), static_cast<int>(n), static_cast<int>(k), 1));
+  auto layout_sfb =
+      GroupedGemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig::
+          tile_atom_to_shape_SFB(cute::make_shape(static_cast<int>(m), static_cast<int>(n), static_cast<int>(k), 1));
+  return {
+      static_cast<int64_t>(cute::size(cute::filter_zeros(layout_sfa))),
+      static_cast<int64_t>(cute::size(cute::filter_zeros(layout_sfb))),
+  };
+#else
+  return {0, 0};
+#endif
+}
+
+bool cutlass_mxfp8_mxfp4_grouped_launch(
+    torch::Tensor a,
+    torch::Tensor a_scale,
+    torch::Tensor b,
+    torch::Tensor b_scale,
+    torch::Tensor d,
+    torch::Tensor m_indices) {
+#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+  return launch_grouped_fp8_fp4(a, a_scale, b, b_scale, d, m_indices);
 #else
   return false;
 #endif

@@ -33,7 +33,7 @@ Implements the DeepGEMM functions used by vLLM for DeepSeek V4 inference:
 | Function | Status | CUTLASS Source |
 |----------|--------|---------------|
 | `fp8_gemm_nt` | planned | Example 87 (blockwise FP8) |
-| `m_grouped_fp8_fp4_gemm_nt_contiguous` | planned | Example 79d (grouped FP4) |
+| `m_grouped_fp8_fp4_gemm_nt_contiguous` | native smoke-tested | Example 72c types + 79d grouped plumbing |
 | `m_grouped_fp8_gemm_nt_contiguous` | planned | Example 79d |
 | `fp8_m_grouped_gemm_nt_masked` | planned | Example 79d |
 | `tf32_hc_prenorm_gemm` | planned | Custom (CUTLASS BF16/TF32 GEMM + fused prenorm) |
@@ -53,7 +53,7 @@ extension inside the DGX Spark/vLLM container:
 
 ```bash
 CONSUMER_DEEP_GEMM_BUILD_CUDA=1 \
-CONSUMER_DEEP_GEMM_CUDA_ARCH=120a \
+CONSUMER_DEEP_GEMM_CUDA_ARCH=121a \
 CUTLASS_PATH=/home/lmxxf/work/deepseek-v4-flash-deployment/DeepGEMM/third-party/cutlass \
 pip install -e .
 ```
@@ -78,7 +78,10 @@ That does three things:
 
 - installs this package in editable mode, including the top-level `deep_gemm`
   compatibility package
-- builds `consumer_deep_gemm._C` for `sm_120a`
+- builds `consumer_deep_gemm._C` for `sm_121a` by default on DGX Spark. The
+  real FP8 x FP4 CUTLASS MMA path needs a native `sm_121a` target on GB10;
+  compiling it as `sm_120a` can pass `can_implement()` but trip CUTLASS'
+  device-side arch guard at launch.
 - writes `vllm.third_party.deep_gemm` as a shim to `consumer_deep_gemm`, because
   DeepSeek V4 MegaMoE currently imports that hard-coded vendored path
 - patches installed vLLM's DeepGEMM support checks to allow SM120/SM121 instead
@@ -115,13 +118,8 @@ docker run --rm --gpus all \
 ```
 
 This validates the Python -> `_C.m_grouped_fp8_fp4_gemm_nt_contiguous` ABI with
-real CUDA tensors. The current native function intentionally returns `None`
-after validation, so Python falls back to the correctness implementation until
-the CUTLASS 79d kernel is wired in.
-
-It also checks the CUTLASS SM120 grouped `mx_float8 x mx_float4 -> bf16`
-`can_implement()` path on a small CUDA problem, proving the current work is past
-the type-only probe stage.
+real CUDA tensors, checks CUTLASS grouped `mx_float8 x mx_float4 -> bf16`
+`can_implement()`, and launches a small zero-input native grouped GEMM.
 
 Requires:
 - CUDA 12.8+

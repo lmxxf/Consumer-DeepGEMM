@@ -61,6 +61,110 @@ def test_cutlass_mxfp8_mxfp4_grouped_can_implement_probe():
     assert native.cutlass_mxfp8_mxfp4_can_implement_probe(a, b, d) is True
 
 
+def test_native_grouped_fp8_fp4_launch_smoke():
+    if not torch.cuda.is_available() or not native.is_available():
+        return
+
+    a = torch.zeros((128, 128), device="cuda", dtype=torch.float8_e4m3fn)
+    a_scale = torch.full((128, 1), 127, device="cuda", dtype=torch.uint8)
+    b = torch.zeros((2, 128, 64), device="cuda", dtype=torch.int8)
+    b_scale = torch.full((2, 128, 4), 127, device="cuda", dtype=torch.uint8)
+    d = torch.empty((128, 128), device="cuda", dtype=torch.bfloat16)
+    m_indices = torch.tensor([64, 128], device="cuda", dtype=torch.int32)
+
+    launched = native.m_grouped_fp8_fp4_gemm_nt_contiguous(
+        (a, a_scale),
+        (b, b_scale),
+        d,
+        m_indices,
+        recipe_a=(1, 128),
+        recipe_b=(1, 32),
+    )
+    torch.cuda.synchronize()
+
+    assert launched is True
+    assert torch.equal(d.cpu(), torch.zeros_like(d).cpu())
+
+
+def test_public_grouped_fp8_fp4_converts_float_scales_for_native():
+    if not torch.cuda.is_available() or not native.is_available():
+        return
+
+    a = torch.zeros((128, 128), device="cuda", dtype=torch.float8_e4m3fn)
+    a_scale = torch.ones((128, 1), device="cuda", dtype=torch.float32)
+    b = torch.zeros((2, 128, 64), device="cuda", dtype=torch.int8)
+    b_scale = torch.ones((2, 128, 4), device="cuda", dtype=torch.float32)
+    d = torch.empty((128, 128), device="cuda", dtype=torch.bfloat16)
+    m_indices = torch.tensor([64, 128], device="cuda", dtype=torch.int32)
+
+    assert dg.m_grouped_fp8_fp4_gemm_nt_contiguous(
+        (a, a_scale),
+        (b, b_scale),
+        d,
+        m_indices,
+        recipe_a=(1, 128),
+        recipe_b=(1, 32),
+    ) is None
+    torch.cuda.synchronize()
+
+    assert torch.equal(d.cpu(), torch.zeros_like(d).cpu())
+
+
+def test_public_grouped_fp8_fp4_accepts_vllm_expert_ids_with_padding():
+    if not torch.cuda.is_available() or not native.is_available():
+        return
+
+    a = torch.zeros((256, 128), device="cuda", dtype=torch.float8_e4m3fn)
+    a_scale = torch.ones((256, 1), device="cuda", dtype=torch.float32)
+    b = torch.zeros((2, 128, 64), device="cuda", dtype=torch.int8)
+    b_scale = torch.ones((2, 128, 4), device="cuda", dtype=torch.float32)
+    d = torch.empty((256, 128), device="cuda", dtype=torch.bfloat16)
+    expert_ids = torch.full((256,), -1, device="cuda", dtype=torch.int32)
+    expert_ids[:17] = 0
+    expert_ids[128:151] = 1
+
+    assert dg.m_grouped_fp8_fp4_gemm_nt_contiguous(
+        (a, a_scale),
+        (b, b_scale),
+        d,
+        expert_ids,
+        recipe_a=(1, 128),
+        recipe_b=(1, 32),
+    ) is None
+    torch.cuda.synchronize()
+
+    assert torch.equal(d.cpu(), torch.zeros_like(d).cpu())
+
+
+def test_public_grouped_fp8_fp4_nonzero_reference_case():
+    if not torch.cuda.is_available() or not native.is_available():
+        return
+
+    a = torch.ones((128, 128), device="cuda", dtype=torch.float32).to(torch.float8_e4m3fn)
+    a_scale = torch.ones((128, 1), device="cuda", dtype=torch.float32)
+    b = torch.full((1, 128, 64), 0x22, device="cuda", dtype=torch.uint8).view(torch.int8)
+    b_scale = torch.ones((1, 128, 4), device="cuda", dtype=torch.float32)
+    d = torch.empty((128, 128), device="cuda", dtype=torch.bfloat16)
+    expert_ids = torch.zeros((128,), device="cuda", dtype=torch.int32)
+
+    dg.m_grouped_fp8_fp4_gemm_nt_contiguous(
+        (a, a_scale),
+        (b, b_scale),
+        d,
+        expert_ids,
+        recipe_a=(1, 128),
+        recipe_b=(1, 32),
+    )
+    torch.cuda.synchronize()
+
+    expected = torch.full_like(d, 128)
+    assert torch.equal(d.cpu(), expected.cpu())
+
+
 if __name__ == "__main__":
     test_native_grouped_fp8_fp4_abi_returns_none_then_fallback_runs()
     test_cutlass_mxfp8_mxfp4_grouped_can_implement_probe()
+    test_native_grouped_fp8_fp4_launch_smoke()
+    test_public_grouped_fp8_fp4_converts_float_scales_for_native()
+    test_public_grouped_fp8_fp4_accepts_vllm_expert_ids_with_padding()
+    test_public_grouped_fp8_fp4_nonzero_reference_case()

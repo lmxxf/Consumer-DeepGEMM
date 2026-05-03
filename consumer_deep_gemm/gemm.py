@@ -58,25 +58,71 @@ def _e8m0_to_float(scale: torch.Tensor) -> torch.Tensor:
 
 
 def _float_scale_to_e8m0(scale: torch.Tensor) -> torch.Tensor:
-    """Convert positive float scales to E8M0 bytes for CUTLASS MX kernels."""
+    """Convert positive float scales to E8M0 bytes for CUTLASS MX kernels.
+
+    E8M0 encodes 2^(e-127). For exact powers of two this is lossless.
+    For non-power-of-two scales we round to nearest exponent.
+    """
     if scale.dtype == torch.uint8:
         return scale.contiguous()
     scale_f = scale.to(torch.float32)
     tiny = torch.finfo(torch.float32).tiny
-    e8m0 = torch.ceil(torch.log2(torch.clamp(scale_f, min=tiny))) + 127.0
+    e8m0 = torch.round(torch.log2(torch.clamp(scale_f, min=tiny))) + 127.0
     return torch.clamp(e8m0, 0, 255).to(torch.uint8).contiguous()
 
 
-def _expand_a_scale_for_cutlass_mx(scale: torch.Tensor) -> torch.Tensor:
-    """Expand per-128-K activation scales to CUTLASS SM120 SFA layout.
+def _reorder_scale_to_cutlass_sf_atom(scale: torch.Tensor, m: int, k_blocks: int) -> torch.Tensor:
+    """Reorder row-major [M, K/SFVecSize] scale to CUTLASS SM120 SfAtom layout.
 
-    vLLM/DeepGEMM's MoE scatter produces activation scales as [M, K / 128].
-    CUTLASS' SM120 block-scaled MX mainloop stores four scale atoms per
-    logical activation scale in the SFA layout used by 72c/79c.
+    The K-major SfAtom for SM120 block-scaled MX is:
+        Shape:  ((32, 4), (SFVecSize, 4))
+        Stride: ((16, 4), (0, 1))
+
+    This means within each 128-row × 4-K_block tile, the data is stored as:
+        for each of 4 k_in_4 values:
+            for each of 4 m_32 blocks (of 32 rows each):
+                scale[m_32, k_in_4] (broadcast across 32 rows within block)
+
+    Since stride-0 dimensions are broadcast, the actual unique data per
+    128×4 tile is 4×4=16 values, stored in the order:
+        [k0_m0, k0_m1, k0_m2, k0_m3, k1_m0, k1_m1, k1_m2, k1_m3, ...]
+
+    But the full tile has 128×4=512 "slots" with broadcast. The actual stored
+    data (filter_zeros) has size = ceil(M/32) * ceil(K_blocks/4) * 4.
+    We just need to interleave the scales in the right order for the 16-element
+    tile atom: groups of 4 m-chunks interleaved with k-blocks-of-4.
     """
-    if scale.dim() == 2:
-        return scale.repeat_interleave(4, dim=1).contiguous()
-    return scale.contiguous()
+    if scale.dim() != 2:
+        return scale.contiguous()
+
+    M, Kb = scale.shape
+    m_tiles = (M + 127) // 128
+    k_tiles = (Kb + 3) // 4
+
+    pad_m = m_tiles * 128 - M
+    pad_k = k_tiles * 4 - Kb
+    if pad_m > 0 or pad_k > 0:
+        scale = torch.nn.functional.pad(scale, (0, pad_k, 0, pad_m), value=127)
+
+    # [m_tiles, 128, k_tiles, 4] -> split 128 into (4 groups of 32)
+    scale = scale.reshape(m_tiles, 4, 32, k_tiles, 4)
+    # Atom offset = m_in_32 * 16 + m_32 * 4 + k_in_4
+    # Target contiguous dim order: [m_tiles, k_tiles, m_in_32, m_32, k_in_4]
+    # strides: [512*k_tiles, 512, 16, 4, 1] — matches SfAtom
+    scale = scale.permute(0, 3, 2, 1, 4).contiguous()
+
+    return scale.reshape(-1).contiguous()
+
+
+def _prepare_sfa_for_native(scale_e8m0: torch.Tensor, sfvec_ratio: int = 4) -> torch.Tensor:
+    """Expand per-128-K E8M0 activation scale to per-32-K and keep as 2D [M, K/32].
+
+    Scale layout reordering is done per-group in C++ launch to handle grouped
+    pointer offsets correctly.
+    """
+    if scale_e8m0.dim() == 2:
+        return scale_e8m0.repeat_interleave(sfvec_ratio, dim=1).contiguous()
+    return scale_e8m0.contiguous()
 
 
 def _native_mxfp8_mxfp4_args(a, b):
@@ -84,12 +130,15 @@ def _native_mxfp8_mxfp4_args(a, b):
         return a, b
     a_tensor, a_scale = a
     b_tensor, b_scale = b
+    a_scale_e8m0 = _float_scale_to_e8m0(a_scale)
+    b_scale_e8m0 = _float_scale_to_e8m0(b_scale)
+    a_scale_e8m0 = _prepare_sfa_for_native(a_scale_e8m0)
     return (
         a_tensor,
-        _expand_a_scale_for_cutlass_mx(_float_scale_to_e8m0(a_scale)),
+        a_scale_e8m0,
     ), (
         b_tensor,
-        _float_scale_to_e8m0(b_scale),
+        b_scale_e8m0,
     )
 
 
@@ -316,37 +365,165 @@ def _m_grouped_fp8_fp4_fallback_nt(a, b, d, m_indices=None):
         d.index_copy_(0, rows, result.to(d.dtype))
 
 
+def _m_grouped_fp8_fallback(a, sfa, b, sfb, d, m_indices, transpose_b=True):
+    a_deq = _dequant_fp8_block(a, sfa)
+    b_deq = _dequant_fp8_block(b, sfb)
+
+    if b_deq.dim() == 2:
+        if transpose_b:
+            result = torch.mm(a_deq.to(torch.float32), b_deq.to(torch.float32).t())
+        else:
+            result = torch.mm(a_deq.to(torch.float32), b_deq.to(torch.float32))
+        d.copy_(result)
+        return
+
+    if b_deq.dim() != 3:
+        raise ValueError(f"grouped B must be 2D or 3D, got shape {tuple(b_deq.shape)}")
+
+    m, k = a_deq.shape
+    num_groups = b_deq.shape[0]
+    d.zero_()
+    for group, rows in enumerate(_grouped_segments_from_indices(m_indices, m, num_groups)):
+        if rows.numel() == 0:
+            continue
+        rows = rows.to(device=a_deq.device)
+        a_group = a_deq.index_select(0, rows).to(torch.float32)
+        b_group = b_deq[group].to(torch.float32)
+        if transpose_b:
+            b_group = _select_group_weight_nt(b_group, k)
+            result = torch.mm(a_group, b_group.t())
+        else:
+            result = torch.mm(a_group, b_group)
+        d.index_copy_(0, rows, result.to(d.dtype))
+
+
 def m_grouped_fp8_gemm_nt_contiguous(a, sfa, b, sfb, d, m_indices=None, **kwargs):
     """M-grouped FP8 GEMM for MoE contiguous layout."""
-    fp8_gemm_nt(a, sfa, b, sfb, d, **kwargs)
+    _m_grouped_fp8_fallback(a, sfa, b, sfb, d, m_indices, transpose_b=True)
 
 
 def m_grouped_fp8_gemm_nn_contiguous(a, sfa, b, sfb, d, m_indices=None, **kwargs):
-    fp8_gemm_nn(a, sfa, b, sfb, d, **kwargs)
+    _m_grouped_fp8_fallback(a, sfa, b, sfb, d, m_indices, transpose_b=False)
+
+
+_fp4_diag_count = 0
+_fp4_diag_limit = 5
 
 
 def m_grouped_fp8_fp4_gemm_nt_contiguous(a, b, d, m_indices=None, **kwargs):
     """M-grouped FP8×FP4 GEMM for MoE contiguous layout."""
+    global _fp4_diag_count
     native_a, native_b = _native_mxfp8_mxfp4_args(a, b)
     native_result = native.m_grouped_fp8_fp4_gemm_nt_contiguous(
         native_a, native_b, d, m_indices, **kwargs
     )
     if native_result is not None:
+        if _fp4_diag_count < _fp4_diag_limit:
+            _fp4_diag_count += 1
+            import sys
+            a_t = a[0] if isinstance(a, tuple) else a
+            b_t = b[0] if isinstance(b, tuple) else b
+            print(f"[CDG] native OK #{_fp4_diag_count}: a={tuple(a_t.shape)}/{a_t.dtype} "
+                  f"b={tuple(b_t.shape)}/{b_t.dtype} d={tuple(d.shape)}/{d.dtype} "
+                  f"m_indices={'None' if m_indices is None else tuple(m_indices.shape)}",
+                  file=sys.stderr, flush=True)
         return
+    if _fp4_diag_count < _fp4_diag_limit:
+        _fp4_diag_count += 1
+        import sys
+        a_t = a[0] if isinstance(a, tuple) else a
+        a_s = a[1] if isinstance(a, tuple) else None
+        b_t = b[0] if isinstance(b, tuple) else b
+        b_s = b[1] if isinstance(b, tuple) else None
+        print(f"[CDG] FALLBACK #{_fp4_diag_count}: a={tuple(a_t.shape)}/{a_t.dtype} "
+              f"a_scale={None if a_s is None else (tuple(a_s.shape), a_s.dtype)} "
+              f"b={tuple(b_t.shape)}/{b_t.dtype} "
+              f"b_scale={None if b_s is None else (tuple(b_s.shape), b_s.dtype)} "
+              f"d={tuple(d.shape)}/{d.dtype} "
+              f"m_indices={'None' if m_indices is None else (tuple(m_indices.shape), m_indices.dtype)}",
+              file=sys.stderr, flush=True)
     _m_grouped_fp8_fp4_fallback_nt(a, b, d, m_indices)
 
 
 def m_grouped_fp8_fp4_gemm_nn_contiguous(a, b, d, m_indices=None, **kwargs):
-    fp8_fp4_gemm_nn(a, b, d, **kwargs)
+    a_deq = _dequant_fp8_arg(a)
+    b_deq = _dequant_fp4_arg(b)
+
+    if b_deq.dim() == 2:
+        result = torch.mm(a_deq.to(torch.float32), b_deq.to(torch.float32))
+        d.copy_(result)
+        return
+
+    if b_deq.dim() != 3:
+        raise ValueError(f"grouped B must be 2D or 3D, got shape {tuple(b_deq.shape)}")
+
+    m, k = a_deq.shape
+    num_groups = b_deq.shape[0]
+    d.zero_()
+    for group, rows in enumerate(_grouped_segments_from_indices(m_indices, m, num_groups)):
+        if rows.numel() == 0:
+            continue
+        rows = rows.to(device=a_deq.device)
+        result = torch.mm(
+            a_deq.index_select(0, rows).to(torch.float32),
+            b_deq[group].to(torch.float32),
+        )
+        d.index_copy_(0, rows, result.to(d.dtype))
 
 
 def m_grouped_fp8_gemm_nt_masked(a, sfa, b, sfb, d, masked_m=None, **kwargs):
-    """M-grouped FP8 GEMM with masking for MoE."""
-    fp8_gemm_nt(a, sfa, b, sfb, d, **kwargs)
+    """M-grouped FP8 GEMM with masking for MoE.
+
+    masked_m is a 1D tensor of per-group row counts. Each group g uses
+    rows [g*block : g*block + masked_m[g]] from A and writes to the
+    corresponding rows of D.
+    """
+    a_deq = _dequant_fp8_block(a, sfa)
+    b_deq = _dequant_fp8_block(b, sfb)
+
+    if b_deq.dim() != 3 or masked_m is None:
+        result = torch.mm(a_deq.to(torch.float32), b_deq.to(torch.float32).t())
+        d.copy_(result)
+        return
+
+    num_groups = b_deq.shape[0]
+    block = a_deq.shape[0] // num_groups
+    masked_m_cpu = masked_m.to("cpu", non_blocking=False).tolist()
+    d.zero_()
+    for g in range(num_groups):
+        count = int(masked_m_cpu[g])
+        if count <= 0:
+            continue
+        row_start = g * block
+        a_g = a_deq[row_start:row_start + count].to(torch.float32)
+        b_g = b_deq[g].to(torch.float32)
+        result = torch.mm(a_g, b_g.t())
+        d[row_start:row_start + count].copy_(result.to(d.dtype))
 
 
 def m_grouped_fp8_fp4_gemm_nt_masked(a, b, d, masked_m=None, **kwargs):
-    fp8_fp4_gemm_nt(a, b, d, **kwargs)
+    """M-grouped FP8×FP4 GEMM with masking for MoE."""
+    a_deq = _dequant_fp8_arg(a)
+    b_deq = _dequant_fp4_arg(b)
+
+    if b_deq.dim() != 3 or masked_m is None:
+        result = torch.mm(a_deq.to(torch.float32), b_deq.to(torch.float32).t())
+        d.copy_(result)
+        return
+
+    num_groups = b_deq.shape[0]
+    block = a_deq.shape[0] // num_groups
+    masked_m_cpu = masked_m.to("cpu", non_blocking=False).tolist()
+    d.zero_()
+    for g in range(num_groups):
+        count = int(masked_m_cpu[g])
+        if count <= 0:
+            continue
+        row_start = g * block
+        a_g = a_deq[row_start:row_start + count].to(torch.float32)
+        b_g = b_deq[g].to(torch.float32)
+        result = torch.mm(a_g, b_g.t())
+        d[row_start:row_start + count].copy_(result.to(d.dtype))
 
 
 def bf16_gemm_nt(a, b, d, c=None, **kwargs):
@@ -377,16 +554,60 @@ def bf16_gemm_tt(a, b, d, c=None, **kwargs):
     d.copy_(result)
 
 
+def _m_grouped_bf16_fallback(a, b, d, m_indices, transpose_b=True):
+    if b.dim() == 2:
+        if transpose_b:
+            result = torch.mm(a.to(torch.float32), b.to(torch.float32).t())
+        else:
+            result = torch.mm(a.to(torch.float32), b.to(torch.float32))
+        d.copy_(result)
+        return
+
+    if b.dim() != 3:
+        raise ValueError(f"grouped B must be 2D or 3D, got shape {tuple(b.shape)}")
+
+    m, k = a.shape
+    num_groups = b.shape[0]
+    d.zero_()
+    for group, rows in enumerate(_grouped_segments_from_indices(m_indices, m, num_groups)):
+        if rows.numel() == 0:
+            continue
+        rows = rows.to(device=a.device)
+        a_group = a.index_select(0, rows).to(torch.float32)
+        b_group = b[group].to(torch.float32)
+        if transpose_b:
+            result = torch.mm(a_group, b_group.t())
+        else:
+            result = torch.mm(a_group, b_group)
+        d.index_copy_(0, rows, result.to(d.dtype))
+
+
 def m_grouped_bf16_gemm_nt_contiguous(a, b, d, m_indices=None, **kwargs):
-    bf16_gemm_nt(a, b, d, **kwargs)
+    _m_grouped_bf16_fallback(a, b, d, m_indices, transpose_b=True)
 
 
 def m_grouped_bf16_gemm_nn_contiguous(a, b, d, m_indices=None, **kwargs):
-    bf16_gemm_nn(a, b, d, **kwargs)
+    _m_grouped_bf16_fallback(a, b, d, m_indices, transpose_b=False)
 
 
 def m_grouped_bf16_gemm_nt_masked(a, b, d, masked_m=None, **kwargs):
-    bf16_gemm_nt(a, b, d, **kwargs)
+    if b.dim() != 3 or masked_m is None:
+        bf16_gemm_nt(a, b, d, **kwargs)
+        return
+
+    num_groups = b.shape[0]
+    block = a.shape[0] // num_groups
+    masked_m_cpu = masked_m.to("cpu", non_blocking=False).tolist()
+    d.zero_()
+    for g in range(num_groups):
+        count = int(masked_m_cpu[g])
+        if count <= 0:
+            continue
+        row_start = g * block
+        a_g = a[row_start:row_start + count].to(torch.float32)
+        b_g = b[g].to(torch.float32)
+        result = torch.mm(a_g, b_g.t())
+        d[row_start:row_start + count].copy_(result.to(d.dtype))
 
 
 def cublaslt_gemm_nt(a, b, d, **kwargs):

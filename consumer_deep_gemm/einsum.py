@@ -18,15 +18,23 @@ def fp8_einsum(
     **kwargs,
 ) -> None:
     """FP8 einsum with scale factors."""
+    from .gemm import _dequant_fp8_block
+
     if isinstance(a, tuple):
         a_tensor, a_scale = a
-        a_f = a_tensor.to(torch.float32)
+        if a_tensor.dim() == 2:
+            a_f = _dequant_fp8_block(a_tensor, a_scale).to(torch.float32)
+        else:
+            a_f = a_tensor.to(torch.float32) * a_scale.to(torch.float32)
     else:
         a_f = a.to(torch.float32)
 
     if isinstance(b, tuple):
         b_tensor, b_scale = b
-        b_f = b_tensor.to(torch.float32)
+        if b_tensor.dim() == 2:
+            b_f = _dequant_fp8_block(b_tensor, b_scale).to(torch.float32)
+        else:
+            b_f = b_tensor.to(torch.float32) * b_scale.to(torch.float32)
     else:
         b_f = b.to(torch.float32)
 

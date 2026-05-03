@@ -240,7 +240,13 @@ struct GroupSegment {
   int count;
 };
 
-std::vector<GroupSegment> segments_from_indices(torch::Tensor m_indices, int m, int groups) {
+struct SegmentResult {
+  std::vector<GroupSegment> segments;
+  std::vector<int> sorted_rows;
+  bool needs_scatter;
+};
+
+SegmentResult segments_from_indices(torch::Tensor m_indices, int m, int groups) {
   auto cpu = m_indices.to(torch::kCPU, /*non_blocking=*/false).contiguous();
   std::vector<int64_t> vals(cpu.numel());
   if (cpu.scalar_type() == torch::kInt32) {
@@ -257,8 +263,8 @@ std::vector<GroupSegment> segments_from_indices(torch::Tensor m_indices, int m, 
     return {};
   }
 
-  std::vector<GroupSegment> out;
   if (static_cast<int>(vals.size()) == groups) {
+    std::vector<GroupSegment> out;
     int start = 0;
     for (int group = 0; group < groups; ++group) {
       int end = static_cast<int>(vals[group]);
@@ -270,37 +276,88 @@ std::vector<GroupSegment> segments_from_indices(torch::Tensor m_indices, int m, 
       }
       start = end;
     }
-    return out;
+    return {std::move(out), {}, false};
   }
 
   if (static_cast<int>(vals.size()) != m) {
     return {};
   }
 
+  std::vector<std::vector<int>> rows_per_group(groups);
+  for (int row = 0; row < m; ++row) {
+    int gid = static_cast<int>(vals[row]);
+    if (gid == -1) continue;
+    if (gid < 0 || gid >= groups) return {};
+    rows_per_group[gid].push_back(row);
+  }
+
+  std::vector<int> sorted_rows;
+  sorted_rows.reserve(m);
+  std::vector<GroupSegment> out;
+  int offset = 0;
   for (int group = 0; group < groups; ++group) {
-    int start = -1;
-    int count = 0;
-    bool closed = false;
-    for (int row = 0; row < m; ++row) {
-      if (vals[row] == group) {
-        if (closed) {
-          return {};
-        }
-        if (start < 0) {
-          start = row;
-        }
-        ++count;
-      } else if (start >= 0) {
-        closed = true;
-      } else if (vals[row] < -1 || vals[row] >= groups) {
-        return {};
-      }
-    }
-    if (count > 0) {
-      out.push_back({group, start, count});
+    auto& rows = rows_per_group[group];
+    if (rows.empty()) continue;
+    out.push_back({group, offset, static_cast<int>(rows.size())});
+    sorted_rows.insert(sorted_rows.end(), rows.begin(), rows.end());
+    offset += static_cast<int>(rows.size());
+  }
+
+  bool already_packed = true;
+  for (int i = 0; i < static_cast<int>(sorted_rows.size()); ++i) {
+    if (sorted_rows[i] != i) { already_packed = false; break; }
+  }
+
+  if (already_packed && static_cast<int>(sorted_rows.size()) == m) {
+    return {std::move(out), {}, false};
+  }
+
+  return {std::move(out), std::move(sorted_rows), true};
+}
+
+torch::Tensor reorder_scale_for_cutlass(const uint8_t* src, int rows, int k_blocks,
+                                        torch::Device device) {
+  const int m_tiles = (rows + 127) / 128;
+  const int k_tiles = (k_blocks + 3) / 4;
+  const int atom_size = 32 * 4 * 4;
+  const int total = m_tiles * k_tiles * atom_size;
+
+  auto result = torch::full({total}, 127, torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU));
+  auto* dst = result.data_ptr<uint8_t>();
+
+  for (int r = 0; r < rows; ++r) {
+    for (int c = 0; c < k_blocks; ++c) {
+      int mt = r / 128;
+      int m_in_tile = r % 128;
+      int m_32 = m_in_tile / 32;
+      int m_in_32 = m_in_tile % 32;
+      int kt = c / 4;
+      int k_in_4 = c % 4;
+      int tile_offset = (mt * k_tiles + kt) * atom_size;
+      int in_tile = m_in_32 * 16 + m_32 * 4 + k_in_4;
+      dst[tile_offset + in_tile] = src[r * k_blocks + c];
     }
   }
-  return out;
+
+  return result.to(device, /*non_blocking=*/false);
+}
+
+torch::Tensor gather_rows(torch::Tensor src, std::vector<int> const& row_indices,
+                          torch::Device device) {
+  auto idx = torch::from_blob(const_cast<int*>(row_indices.data()),
+                              {static_cast<int64_t>(row_indices.size())},
+                              torch::TensorOptions().dtype(torch::kInt32))
+                 .to(device, torch::kLong, /*non_blocking=*/false);
+  return src.index_select(0, idx).contiguous();
+}
+
+void scatter_rows(torch::Tensor dst, torch::Tensor packed_src,
+                  std::vector<int> const& row_indices, torch::Device device) {
+  auto idx = torch::from_blob(const_cast<int*>(row_indices.data()),
+                              {static_cast<int64_t>(row_indices.size())},
+                              torch::TensorOptions().dtype(torch::kInt32))
+                 .to(device, torch::kLong, /*non_blocking=*/false);
+  dst.index_copy_(0, idx, packed_src);
 }
 
 bool launch_grouped_fp8_fp4(torch::Tensor a, torch::Tensor a_scale, torch::Tensor b,
@@ -309,9 +366,26 @@ bool launch_grouped_fp8_fp4(torch::Tensor a, torch::Tensor a_scale, torch::Tenso
   const int m = static_cast<int>(a.size(0));
   const int k = static_cast<int>(a.size(1));
   const int n = static_cast<int>(b.size(1));
-  auto segments = segments_from_indices(m_indices, m, groups);
-  if (segments.empty()) {
+  auto seg_result = segments_from_indices(m_indices, m, groups);
+  if (seg_result.segments.empty()) {
     return false;
+  }
+
+  auto device = a.device();
+  auto const& segments = seg_result.segments;
+
+  torch::Tensor a_work = a;
+  torch::Tensor a_scale_work = a_scale;
+  torch::Tensor d_work;
+
+  if (seg_result.needs_scatter) {
+    a_work = gather_rows(a, seg_result.sorted_rows, device);
+    a_scale_work = gather_rows(a_scale, seg_result.sorted_rows, device);
+    int total_active = static_cast<int>(seg_result.sorted_rows.size());
+    d_work = torch::empty({total_active, n},
+                          torch::TensorOptions().device(device).dtype(d.scalar_type()));
+  } else {
+    d_work = d;
   }
 
   std::vector<GroupProblemShape::UnderlyingProblemShape> problem_sizes;
@@ -328,17 +402,23 @@ bool launch_grouped_fp8_fp4(torch::Tensor a, torch::Tensor a_scale, torch::Tenso
   std::vector<uintptr_t> ptr_sfa;
   std::vector<uintptr_t> ptr_sfb;
 
-  const int64_t a_row_stride = a.stride(0);
-  const int64_t d_row_stride = d.stride(0);
+  const int64_t a_row_stride = a_work.stride(0);
+  const int64_t d_row_stride = d_work.stride(0);
   const int64_t b_group_stride = b.stride(0);
-  const int64_t b_scale_group_stride = b_scale.dim() > 0 ? b_scale.stride(0) : 0;
-  const int64_t a_scale_row_stride = a_scale.dim() > 0 ? a_scale.stride(0) : 0;
 
-  auto* a_base = reinterpret_cast<uint8_t*>(a.data_ptr());
+  auto* a_base = reinterpret_cast<uint8_t*>(a_work.data_ptr());
   auto* b_base = reinterpret_cast<uint8_t*>(b.data_ptr());
-  auto* d_base = reinterpret_cast<uint8_t*>(d.data_ptr());
-  auto* a_scale_base = reinterpret_cast<uint8_t*>(a_scale.data_ptr());
-  auto* b_scale_base = reinterpret_cast<uint8_t*>(b_scale.data_ptr());
+  auto* d_base = reinterpret_cast<uint8_t*>(d_work.data_ptr());
+
+  const int a_scale_cols = a_scale_work.dim() >= 2 ? static_cast<int>(a_scale_work.size(1)) : static_cast<int>(a_scale_work.numel()) / m;
+  const int b_scale_cols = b_scale.dim() >= 2 ? static_cast<int>(b_scale.size(-1)) : 1;
+  auto a_scale_cpu = a_scale_work.to(torch::kCPU).contiguous().to(torch::kUInt8);
+  auto b_scale_cpu = b_scale.to(torch::kCPU).contiguous().to(torch::kUInt8);
+  auto* a_scale_data = a_scale_cpu.data_ptr<uint8_t>();
+  auto* b_scale_data = b_scale_cpu.data_ptr<uint8_t>();
+
+  std::vector<torch::Tensor> sfa_buffers;
+  std::vector<torch::Tensor> sfb_buffers;
 
   for (auto const& seg : segments) {
     problem_sizes.push_back({seg.count, n, k});
@@ -353,16 +433,25 @@ bool launch_grouped_fp8_fp4(torch::Tensor a, torch::Tensor a_scale, torch::Tenso
         GroupedGemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig::
             tile_atom_to_shape_SFB(cute::make_shape(seg.count, n, k, 1)));
 
-    ptr_a.push_back(reinterpret_cast<uintptr_t>(a_base + seg.start * a_row_stride * a.element_size()));
+    ptr_a.push_back(reinterpret_cast<uintptr_t>(a_base + seg.start * a_row_stride * a_work.element_size()));
     ptr_b.push_back(reinterpret_cast<uintptr_t>(b_base + seg.group * b_group_stride * b.element_size()));
     ptr_c.push_back(0);
-    ptr_d.push_back(reinterpret_cast<uintptr_t>(d_base + seg.start * d_row_stride * d.element_size()));
-    ptr_sfa.push_back(reinterpret_cast<uintptr_t>(a_scale_base + seg.start * a_scale_row_stride * a_scale.element_size()));
-    ptr_sfb.push_back(reinterpret_cast<uintptr_t>(b_scale_base + seg.group * b_scale_group_stride * b_scale.element_size()));
+    ptr_d.push_back(reinterpret_cast<uintptr_t>(d_base + seg.start * d_row_stride * d_work.element_size()));
+
+    auto sfa_buf = reorder_scale_for_cutlass(
+        a_scale_data + seg.start * a_scale_cols,
+        seg.count, a_scale_cols, device);
+    sfa_buffers.push_back(sfa_buf);
+    ptr_sfa.push_back(reinterpret_cast<uintptr_t>(sfa_buf.data_ptr()));
+
+    auto sfb_buf = reorder_scale_for_cutlass(
+        b_scale_data + seg.group * n * b_scale_cols,
+        n, b_scale_cols, device);
+    sfb_buffers.push_back(sfb_buf);
+    ptr_sfb.push_back(reinterpret_cast<uintptr_t>(sfb_buf.data_ptr()));
   }
 
   const int active = static_cast<int>(segments.size());
-  auto device = a.device();
   auto problem_sizes_dev = device_copy_from_host(problem_sizes, device);
   auto stride_a_dev = device_copy_from_host(stride_a, device);
   auto stride_b_dev = device_copy_from_host(stride_b, device);
@@ -420,7 +509,9 @@ bool launch_grouped_fp8_fp4(torch::Tensor a, torch::Tensor a_scale, torch::Tenso
     return false;
   }
 
-  d.zero_();
+  if (!seg_result.needs_scatter) {
+    d.zero_();
+  }
   const size_t workspace_size = GroupedGemm::get_workspace_size(arguments);
   auto workspace = torch::empty({static_cast<int64_t>(workspace_size)},
                                 torch::TensorOptions().device(device).dtype(torch::kUInt8));
@@ -431,7 +522,15 @@ bool launch_grouped_fp8_fp4(torch::Tensor a, torch::Tensor a_scale, torch::Tenso
     return false;
   }
   status = gemm.run(stream);
-  return status == cutlass::Status::kSuccess;
+  if (status != cutlass::Status::kSuccess) {
+    return false;
+  }
+
+  if (seg_result.needs_scatter) {
+    d.zero_();
+    scatter_rows(d, d_work, seg_result.sorted_rows, device);
+  }
+  return true;
 }
 
 #endif

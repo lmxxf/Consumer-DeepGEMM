@@ -161,6 +161,36 @@ def test_public_grouped_fp8_fp4_nonzero_reference_case():
     assert torch.equal(d.cpu(), expected.cpu())
 
 
+def test_public_grouped_fp8_fp4_interleaved_expert_ids():
+    """Non-contiguous expert_ids [1,0,1,0] — must still produce correct results via scatter/gather."""
+    if not torch.cuda.is_available() or not native.is_available():
+        return
+
+    a = torch.ones((4, 4), device="cuda", dtype=torch.bfloat16)
+    packed = torch.tensor(
+        [
+            [[0x21, 0x43]],  # group 0: dequant to [0.5, 1.0, 1.5, 2.0] -> sum=5
+            [[0x44, 0x44]],  # group 1: dequant to [2.0, 2.0, 2.0, 2.0] -> sum=8
+        ],
+        device="cuda",
+        dtype=torch.uint8,
+    ).view(torch.int8)
+    scale = torch.full((2, 1, 1), 127, device="cuda", dtype=torch.uint8)
+    groups = torch.tensor([1, 0, 1, 0], device="cuda", dtype=torch.int32)
+    d = torch.empty((4, 1), device="cuda", dtype=torch.bfloat16)
+
+    dg.m_grouped_fp8_fp4_gemm_nt_contiguous(
+        (a, torch.ones((4, 1), device="cuda")),
+        (packed, scale),
+        d,
+        groups,
+    )
+    torch.cuda.synchronize()
+
+    expected = torch.tensor([[8.0], [5.0], [8.0], [5.0]], dtype=torch.bfloat16)
+    assert torch.equal(d.cpu(), expected), f"got {d.cpu()} expected {expected}"
+
+
 if __name__ == "__main__":
     test_native_grouped_fp8_fp4_abi_returns_none_then_fallback_runs()
     test_cutlass_mxfp8_mxfp4_grouped_can_implement_probe()
@@ -168,3 +198,5 @@ if __name__ == "__main__":
     test_public_grouped_fp8_fp4_converts_float_scales_for_native()
     test_public_grouped_fp8_fp4_accepts_vllm_expert_ids_with_padding()
     test_public_grouped_fp8_fp4_nonzero_reference_case()
+    test_public_grouped_fp8_fp4_interleaved_expert_ids()
+    print("all tests passed")

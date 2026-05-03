@@ -131,8 +131,8 @@ def _native_mxfp8_mxfp4_args(a, b):
     a_tensor, a_scale = a
     b_tensor, b_scale = b
     a_scale_e8m0 = _float_scale_to_e8m0(a_scale)
-    b_scale_e8m0 = _float_scale_to_e8m0(b_scale)
     a_scale_e8m0 = _prepare_sfa_for_native(a_scale_e8m0)
+    b_scale_e8m0 = _float_scale_to_e8m0(b_scale)
     return (
         a_tensor,
         a_scale_e8m0,
@@ -412,36 +412,12 @@ _fp4_diag_limit = 5
 
 def m_grouped_fp8_fp4_gemm_nt_contiguous(a, b, d, m_indices=None, **kwargs):
     """M-grouped FP8×FP4 GEMM for MoE contiguous layout."""
-    global _fp4_diag_count
     native_a, native_b = _native_mxfp8_mxfp4_args(a, b)
     native_result = native.m_grouped_fp8_fp4_gemm_nt_contiguous(
         native_a, native_b, d, m_indices, **kwargs
     )
     if native_result is not None:
-        if _fp4_diag_count < _fp4_diag_limit:
-            _fp4_diag_count += 1
-            import sys
-            a_t = a[0] if isinstance(a, tuple) else a
-            b_t = b[0] if isinstance(b, tuple) else b
-            print(f"[CDG] native OK #{_fp4_diag_count}: a={tuple(a_t.shape)}/{a_t.dtype} "
-                  f"b={tuple(b_t.shape)}/{b_t.dtype} d={tuple(d.shape)}/{d.dtype} "
-                  f"m_indices={'None' if m_indices is None else tuple(m_indices.shape)}",
-                  file=sys.stderr, flush=True)
         return
-    if _fp4_diag_count < _fp4_diag_limit:
-        _fp4_diag_count += 1
-        import sys
-        a_t = a[0] if isinstance(a, tuple) else a
-        a_s = a[1] if isinstance(a, tuple) else None
-        b_t = b[0] if isinstance(b, tuple) else b
-        b_s = b[1] if isinstance(b, tuple) else None
-        print(f"[CDG] FALLBACK #{_fp4_diag_count}: a={tuple(a_t.shape)}/{a_t.dtype} "
-              f"a_scale={None if a_s is None else (tuple(a_s.shape), a_s.dtype)} "
-              f"b={tuple(b_t.shape)}/{b_t.dtype} "
-              f"b_scale={None if b_s is None else (tuple(b_s.shape), b_s.dtype)} "
-              f"d={tuple(d.shape)}/{d.dtype} "
-              f"m_indices={'None' if m_indices is None else (tuple(m_indices.shape), m_indices.dtype)}",
-              file=sys.stderr, flush=True)
     _m_grouped_fp8_fp4_fallback_nt(a, b, d, m_indices)
 
 

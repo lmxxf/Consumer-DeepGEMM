@@ -315,6 +315,49 @@ SegmentResult segments_from_indices(torch::Tensor m_indices, int m, int groups) 
   return {std::move(out), std::move(sorted_rows), true};
 }
 
+}  // close anonymous namespace for kernel definition
+
+__global__ void reorder_scale_kernel(const uint8_t* __restrict__ src,
+                                     uint8_t* __restrict__ dst,
+                                     int rows, int k_blocks,
+                                     int k_tiles, int atom_size) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total_src = rows * k_blocks;
+  if (idx >= total_src) return;
+
+  int r = idx / k_blocks;
+  int c = idx % k_blocks;
+  int mt = r / 128;
+  int m_in_tile = r % 128;
+  int m_32 = m_in_tile / 32;
+  int m_in_32 = m_in_tile % 32;
+  int kt = c / 4;
+  int k_in_4 = c % 4;
+  int tile_offset = (mt * k_tiles + kt) * atom_size;
+  int in_tile = m_in_32 * 16 + m_32 * 4 + k_in_4;
+  dst[tile_offset + in_tile] = src[idx];
+}
+
+torch::Tensor reorder_scale_on_gpu(torch::Tensor src_gpu, int rows, int k_blocks) {
+  const int m_tiles = (rows + 127) / 128;
+  const int k_tiles = (k_blocks + 3) / 4;
+  const int atom_size = 32 * 4 * 4;
+  const int total_out = m_tiles * k_tiles * atom_size;
+
+  auto result = torch::full({total_out}, 127,
+                            torch::TensorOptions().dtype(torch::kUInt8).device(src_gpu.device()));
+  int total_src = rows * k_blocks;
+  int threads = 256;
+  int blocks = (total_src + threads - 1) / threads;
+  auto stream = c10::cuda::getCurrentCUDAStream(src_gpu.get_device()).stream();
+  reorder_scale_kernel<<<blocks, threads, 0, stream>>>(
+      src_gpu.data_ptr<uint8_t>(), result.data_ptr<uint8_t>(),
+      rows, k_blocks, k_tiles, atom_size);
+  return result;
+}
+
+namespace {  // re-open anonymous namespace
+
 torch::Tensor reorder_scale_for_cutlass(const uint8_t* src, int rows, int k_blocks,
                                         torch::Device device) {
   const int m_tiles = (rows + 127) / 128;
@@ -412,10 +455,6 @@ bool launch_grouped_fp8_fp4(torch::Tensor a, torch::Tensor a_scale, torch::Tenso
 
   const int a_scale_cols = a_scale_work.dim() >= 2 ? static_cast<int>(a_scale_work.size(1)) : static_cast<int>(a_scale_work.numel()) / m;
   const int b_scale_cols = b_scale.dim() >= 2 ? static_cast<int>(b_scale.size(-1)) : 1;
-  auto a_scale_cpu = a_scale_work.to(torch::kCPU).contiguous().to(torch::kUInt8);
-  auto b_scale_cpu = b_scale.to(torch::kCPU).contiguous().to(torch::kUInt8);
-  auto* a_scale_data = a_scale_cpu.data_ptr<uint8_t>();
-  auto* b_scale_data = b_scale_cpu.data_ptr<uint8_t>();
 
   std::vector<torch::Tensor> sfa_buffers;
   std::vector<torch::Tensor> sfb_buffers;
@@ -438,17 +477,29 @@ bool launch_grouped_fp8_fp4(torch::Tensor a, torch::Tensor a_scale, torch::Tenso
     ptr_c.push_back(0);
     ptr_d.push_back(reinterpret_cast<uintptr_t>(d_base + seg.start * d_row_stride * d_work.element_size()));
 
-    auto sfa_buf = reorder_scale_for_cutlass(
-        a_scale_data + seg.start * a_scale_cols,
-        seg.count, a_scale_cols, device);
-    sfa_buffers.push_back(sfa_buf);
-    ptr_sfa.push_back(reinterpret_cast<uintptr_t>(sfa_buf.data_ptr()));
+    {
+      auto sfa_slice = a_scale_work.is_cuda()
+          ? a_scale_work.narrow(0, seg.start, seg.count).contiguous().view(-1).to(torch::kUInt8)
+          : a_scale_work.narrow(0, seg.start, seg.count).contiguous().view(-1).to(torch::kUInt8).to(device);
+      auto sfa_buf = reorder_scale_on_gpu(sfa_slice, seg.count, a_scale_cols);
+      sfa_buffers.push_back(sfa_buf);
+      ptr_sfa.push_back(reinterpret_cast<uintptr_t>(sfa_buf.data_ptr()));
+    }
 
-    auto sfb_buf = reorder_scale_for_cutlass(
-        b_scale_data + seg.group * n * b_scale_cols,
-        n, b_scale_cols, device);
-    sfb_buffers.push_back(sfb_buf);
-    ptr_sfb.push_back(reinterpret_cast<uintptr_t>(sfb_buf.data_ptr()));
+    {
+      torch::Tensor sfb_flat;
+      if (b_scale.dim() == 3) {
+        sfb_flat = b_scale.select(0, seg.group).contiguous().view(-1).to(torch::kUInt8);
+      } else {
+        sfb_flat = b_scale.contiguous().view(-1).to(torch::kUInt8);
+      }
+      if (!sfb_flat.is_cuda()) {
+        sfb_flat = sfb_flat.to(device);
+      }
+      auto sfb_buf = reorder_scale_on_gpu(sfb_flat, n, b_scale_cols);
+      sfb_buffers.push_back(sfb_buf);
+      ptr_sfb.push_back(reinterpret_cast<uintptr_t>(sfb_buf.data_ptr()));
+    }
   }
 
   const int active = static_cast<int>(segments.size());

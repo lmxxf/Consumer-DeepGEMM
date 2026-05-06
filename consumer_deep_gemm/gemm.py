@@ -406,10 +406,6 @@ def m_grouped_fp8_gemm_nn_contiguous(a, sfa, b, sfb, d, m_indices=None, **kwargs
     _m_grouped_fp8_fallback(a, sfa, b, sfb, d, m_indices, transpose_b=False)
 
 
-_fp4_diag_count = 0
-_fp4_diag_limit = 5
-
-
 def m_grouped_fp8_fp4_gemm_nt_contiguous(a, b, d, m_indices=None, **kwargs):
     """M-grouped FP8×FP4 GEMM for MoE contiguous layout."""
     native_a, native_b = _native_mxfp8_mxfp4_args(a, b)

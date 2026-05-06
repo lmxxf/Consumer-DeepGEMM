@@ -66,11 +66,14 @@ def test_native_grouped_fp8_fp4_launch_smoke():
         return
 
     a = torch.zeros((128, 128), device="cuda", dtype=torch.float8_e4m3fn)
-    a_scale = torch.full((128, 1), 127, device="cuda", dtype=torch.uint8)
+    a_scale = torch.full((128, 4), 127, device="cuda", dtype=torch.uint8)
     b = torch.zeros((2, 128, 64), device="cuda", dtype=torch.int8)
     b_scale = torch.full((2, 128, 4), 127, device="cuda", dtype=torch.uint8)
     d = torch.empty((128, 128), device="cuda", dtype=torch.bfloat16)
-    m_indices = torch.tensor([64, 128], device="cuda", dtype=torch.int32)
+    # Per-row expert_ids format (vLLM contiguous layout)
+    m_indices = torch.full((128,), -1, device="cuda", dtype=torch.int32)
+    m_indices[:64] = 0
+    m_indices[64:128] = 1
 
     launched = native.m_grouped_fp8_fp4_gemm_nt_contiguous(
         (a, a_scale),
@@ -91,11 +94,13 @@ def test_public_grouped_fp8_fp4_converts_float_scales_for_native():
         return
 
     a = torch.zeros((128, 128), device="cuda", dtype=torch.float8_e4m3fn)
-    a_scale = torch.ones((128, 1), device="cuda", dtype=torch.float32)
+    a_scale = torch.ones((128, 4), device="cuda", dtype=torch.float32)
     b = torch.zeros((2, 128, 64), device="cuda", dtype=torch.int8)
     b_scale = torch.ones((2, 128, 4), device="cuda", dtype=torch.float32)
     d = torch.empty((128, 128), device="cuda", dtype=torch.bfloat16)
-    m_indices = torch.tensor([64, 128], device="cuda", dtype=torch.int32)
+    m_indices = torch.full((128,), -1, device="cuda", dtype=torch.int32)
+    m_indices[:64] = 0
+    m_indices[64:128] = 1
 
     assert dg.m_grouped_fp8_fp4_gemm_nt_contiguous(
         (a, a_scale),

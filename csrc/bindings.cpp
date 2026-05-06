@@ -17,6 +17,7 @@ bool cutlass_mxfp8_mxfp4_grouped_launch(
     torch::Tensor b_scale,
     torch::Tensor d,
     torch::Tensor m_indices);
+void clear_sfb_cache();
 
 namespace py = pybind11;
 
@@ -115,6 +116,11 @@ py::object m_grouped_fp8_fp4_gemm_nt_contiguous_stub(
   }
 
   auto indices = tensor_from_object(m_indices, "m_indices");
+  // Only per-row expert_ids format is supported (len == M).
+  // Cumsum format (len == G) falls back to Python.
+  if (indices.numel() != a.size(0)) {
+    return py::none();
+  }
   const bool launched = cutlass_mxfp8_mxfp4_grouped_launch(a, a_scale, b, b_scale, d, indices);
   if (!launched) {
     return py::none();
@@ -138,4 +144,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("b"),
       py::arg("d"),
       py::arg("m_indices") = py::none());
+  m.def("clear_sfb_cache", &clear_sfb_cache);
 }

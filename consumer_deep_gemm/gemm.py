@@ -34,6 +34,8 @@ def _dequant_fp8_block(x: torch.Tensor, scale: torch.Tensor, block_k: int = 128)
         return x
     orig_shape = x.shape
     M, K = orig_shape[0], orig_shape[1]
+    if scale.dim() == 2 and scale.shape[1] > 1:
+        block_k = K // scale.shape[1]
     n_blocks = (K + block_k - 1) // block_k
     pad = n_blocks * block_k - K
 
@@ -406,15 +408,65 @@ def m_grouped_fp8_gemm_nn_contiguous(a, sfa, b, sfb, d, m_indices=None, **kwargs
     _m_grouped_fp8_fallback(a, sfa, b, sfb, d, m_indices, transpose_b=False)
 
 
+def _m_grouped_fp8_fp4_dequant_mm_nt(a, b, d, m_indices):
+    """FP4 dequant + torch.mm path — bypasses CUTLASS launch overhead.
+
+    Only dequantizes the active experts (typically 6 out of 256),
+    then uses cuBLAS BF16 matmul which handles small M efficiently.
+    """
+    a_deq = _dequant_fp8_arg(a)
+
+    if isinstance(b, tuple):
+        b_tensor, b_scale = b
+    else:
+        b_tensor = b
+        b_scale = None
+    if b_tensor.dtype == torch.int8:
+        b_tensor = b_tensor.view(torch.uint8)
+
+    if b_tensor.dim() != 3:
+        b_deq = _dequant_fp4_block(b_tensor, b_scale)
+        result = torch.mm(a_deq.to(torch.float32), b_deq.to(torch.float32).t())
+        d.copy_(result.to(d.dtype))
+        return
+
+    m, k = a_deq.shape
+    num_groups = b_tensor.size(0)
+
+    if m_indices is None or m_indices.numel() != m:
+        _m_grouped_fp8_fp4_fallback_nt(a, b, d, m_indices)
+        return
+
+    active_groups = m_indices[m_indices >= 0].unique()
+    if active_groups.numel() == 0:
+        d.zero_()
+        return
+
+    d.zero_()
+    for gid_t in active_groups:
+        gid = gid_t.item()
+        mask = (m_indices == gid)
+        rows = mask.nonzero(as_tuple=False).flatten()
+        if rows.numel() == 0:
+            continue
+
+        b_group_scale = None
+        if b_scale is not None:
+            if b_scale.dim() == 3:
+                b_group_scale = b_scale[gid]
+            else:
+                b_group_scale = b_scale
+        b_group_deq = _dequant_fp4_block(b_tensor[gid], b_group_scale)
+        b_group_deq = _select_group_weight_nt(b_group_deq, k)
+
+        a_group = a_deq.index_select(0, rows).to(torch.float32)
+        result = torch.mm(a_group, b_group_deq.to(torch.float32).t())
+        d.index_copy_(0, rows, result.to(d.dtype))
+
+
 def m_grouped_fp8_fp4_gemm_nt_contiguous(a, b, d, m_indices=None, **kwargs):
     """M-grouped FP8×FP4 GEMM for MoE contiguous layout."""
-    native_a, native_b = _native_mxfp8_mxfp4_args(a, b)
-    native_result = native.m_grouped_fp8_fp4_gemm_nt_contiguous(
-        native_a, native_b, d, m_indices, **kwargs
-    )
-    if native_result is not None:
-        return
-    _m_grouped_fp8_fp4_fallback_nt(a, b, d, m_indices)
+    _m_grouped_fp8_fp4_dequant_mm_nt(a, b, d, m_indices)
 
 
 def m_grouped_fp8_fp4_gemm_nn_contiguous(a, b, d, m_indices=None, **kwargs):

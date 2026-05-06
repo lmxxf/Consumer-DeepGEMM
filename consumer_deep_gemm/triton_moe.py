@@ -128,6 +128,149 @@ def triton_dequant_fp4(b_packed: torch.Tensor, b_scale: torch.Tensor) -> torch.T
 
 
 
+@triton.jit
+def _dequant_fp4_vals(packed, scale_f):
+    """Inline helper: unpack uint8 -> two float32 values, apply scale."""
+    low_idx = (packed & 0x0F).to(tl.int32)
+    high_idx = ((packed >> 4) & 0x0F).to(tl.int32)
+
+    low_sign = (low_idx >> 3).to(tl.float32)
+    low_mag = low_idx & 0x07
+    low_abs = tl.where(low_mag == 0, 0.0,
+              tl.where(low_mag == 1, 0.5,
+              tl.where(low_mag == 2, 1.0,
+              tl.where(low_mag == 3, 1.5,
+              tl.where(low_mag == 4, 2.0,
+              tl.where(low_mag == 5, 3.0,
+              tl.where(low_mag == 6, 4.0, 6.0)))))))
+    low_val = tl.where(low_sign > 0.5, -low_abs, low_abs) * scale_f
+
+    high_sign = (high_idx >> 3).to(tl.float32)
+    high_mag = high_idx & 0x07
+    high_abs = tl.where(high_mag == 0, 0.0,
+               tl.where(high_mag == 1, 0.5,
+               tl.where(high_mag == 2, 1.0,
+               tl.where(high_mag == 3, 1.5,
+               tl.where(high_mag == 4, 2.0,
+               tl.where(high_mag == 5, 3.0,
+               tl.where(high_mag == 6, 4.0, 6.0)))))))
+    high_val = tl.where(high_sign > 0.5, -high_abs, high_abs) * scale_f
+
+    return low_val, high_val
+
+
+@triton.jit
+def _fused_dequant_matmul_kernel(
+    # A: [M, K] bf16 (already FP8-dequanted)
+    a_ptr, a_stride_m, a_stride_k,
+    # B: [N, K_packed] uint8 packed FP4
+    b_ptr, b_stride_n, b_stride_k,
+    # B scale: [N, K_scale] uint8 E8M0
+    bs_ptr, bs_stride_n, bs_stride_k,
+    # D: [M, N] bf16 output
+    d_ptr, d_stride_m, d_stride_n,
+    M, N, K: tl.constexpr,
+    K_PACKED: tl.constexpr,
+    K_SCALE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,  # number of actual K values per iteration (must be even)
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    m_offs = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    n_offs = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    m_mask = m_offs < M
+    n_mask = n_offs < N
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    BLOCK_K_PACKED: tl.constexpr = BLOCK_K // 2
+
+    for k_start in range(0, K, BLOCK_K):
+        k_packed_start = k_start // 2
+        k_packed_offs = k_packed_start + tl.arange(0, BLOCK_K_PACKED)
+        k_packed_mask = k_packed_offs < K_PACKED
+
+        # Load A even columns: a[m, k_start], a[m, k_start+2], ...
+        # These correspond to the "low" nibble of each packed byte
+        k_even_offs = k_start + tl.arange(0, BLOCK_K_PACKED) * 2
+        a_even = tl.load(
+            a_ptr + m_offs[:, None] * a_stride_m + k_even_offs[None, :] * a_stride_k,
+            mask=m_mask[:, None] & (k_even_offs[None, :] < K),
+            other=0.0
+        ).to(tl.float32)
+
+        # Load A odd columns: a[m, k_start+1], a[m, k_start+3], ...
+        k_odd_offs = k_start + tl.arange(0, BLOCK_K_PACKED) * 2 + 1
+        a_odd = tl.load(
+            a_ptr + m_offs[:, None] * a_stride_m + k_odd_offs[None, :] * a_stride_k,
+            mask=m_mask[:, None] & (k_odd_offs[None, :] < K),
+            other=0.0
+        ).to(tl.float32)
+
+        # Load B packed block: [BLOCK_N, BLOCK_K_PACKED]
+        b_packed = tl.load(
+            b_ptr + n_offs[:, None] * b_stride_n + k_packed_offs[None, :] * b_stride_k,
+            mask=n_mask[:, None] & k_packed_mask[None, :],
+            other=0
+        ).to(tl.uint8)
+
+        # Load scales: each covers 16 packed bytes = 32 values
+        scale_k_offs = k_packed_offs // 16
+        b_scale = tl.load(
+            bs_ptr + n_offs[:, None] * bs_stride_n + scale_k_offs[None, :] * bs_stride_k,
+            mask=n_mask[:, None] & (scale_k_offs[None, :] < K_SCALE),
+            other=127
+        ).to(tl.float32)
+        scale_f = tl.exp2(b_scale - 127.0)
+
+        low_val, high_val = _dequant_fp4_vals(b_packed, scale_f)
+
+        # [BLOCK_M, BLOCK_K_PACKED] x [BLOCK_N, BLOCK_K_PACKED]^T = [BLOCK_M, BLOCK_N]
+        acc += tl.dot(a_even, tl.trans(low_val), input_precision="ieee")
+        acc += tl.dot(a_odd, tl.trans(high_val), input_precision="ieee")
+
+    # Store result
+    d_block = acc.to(tl.bfloat16)
+    tl.store(
+        d_ptr + m_offs[:, None] * d_stride_m + n_offs[None, :] * d_stride_n,
+        d_block,
+        mask=m_mask[:, None] & n_mask[None, :]
+    )
+
+
+def triton_fused_fp4_matmul_nt(a_bf16, b_packed, b_scale_u8, out):
+    """Fused FP4 dequant + matmul: D = A @ dequant(B)^T.
+
+    A: [M, K] bf16
+    B: [N, K//2] uint8 packed FP4
+    b_scale: [N, K//32] uint8 E8M0
+    out: [M, N] bf16
+    """
+    M, K = a_bf16.shape
+    N = b_packed.shape[0]
+    K_packed = K // 2
+    K_scale = K // 32
+
+    BLOCK_M = min(64, triton.next_power_of_2(M))
+    BLOCK_N = 32
+    BLOCK_K = 64  # must be even; processes 32 packed bytes per iter
+
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+
+    _fused_dequant_matmul_kernel[grid](
+        a_bf16, a_bf16.stride(0), a_bf16.stride(1),
+        b_packed, b_packed.stride(0), b_packed.stride(1),
+        b_scale_u8, b_scale_u8.stride(0), b_scale_u8.stride(1),
+        out, out.stride(0), out.stride(1),
+        M, N, K, K_packed, K_scale,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+    )
+
+
 _e8m0_cache = {}
 
 
@@ -203,12 +346,8 @@ def m_grouped_fp8_fp4_gemm_nt_contiguous_triton(a, b, d, m_indices=None, **kwarg
             continue
 
         gs = b_scale_u8[gid] if (b_scale_u8 is not None and b_scale_u8.dim() == 3) else b_scale_u8
-        b_group_deq = triton_dequant_fp4(b_tensor[gid], gs)
+        a_group = a_deq.index_select(0, rows)
 
-        if b_group_deq.shape[-1] != k:
-            if b_group_deq.shape[0] == k:
-                b_group_deq = b_group_deq.t().contiguous()
-
-        a_group = a_deq.index_select(0, rows).to(torch.float32)
-        result = torch.mm(a_group, b_group_deq.to(torch.float32).t())
-        d.index_copy_(0, rows, result.to(d.dtype))
+        result = torch.empty(rows.numel(), b_tensor.shape[1], dtype=d.dtype, device=d.device)
+        triton_fused_fp4_matmul_nt(a_group, b_tensor[gid], gs, result)
+        d.index_copy_(0, rows, result)

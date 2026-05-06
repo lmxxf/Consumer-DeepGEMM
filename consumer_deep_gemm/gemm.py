@@ -466,7 +466,8 @@ def _m_grouped_fp8_fp4_dequant_mm_nt(a, b, d, m_indices):
 
 def m_grouped_fp8_fp4_gemm_nt_contiguous(a, b, d, m_indices=None, **kwargs):
     """M-grouped FP8×FP4 GEMM for MoE contiguous layout."""
-    _m_grouped_fp8_fp4_dequant_mm_nt(a, b, d, m_indices)
+    from .triton_moe import m_grouped_fp8_fp4_gemm_nt_contiguous_triton
+    m_grouped_fp8_fp4_gemm_nt_contiguous_triton(a, b, d, m_indices)
 
 
 def m_grouped_fp8_fp4_gemm_nn_contiguous(a, b, d, m_indices=None, **kwargs):

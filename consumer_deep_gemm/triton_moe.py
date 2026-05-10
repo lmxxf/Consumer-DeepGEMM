@@ -445,6 +445,93 @@ def _dot_scaled_matmul_kernel(
     )
 
 
+@triton.jit
+def _grouped_dot_scaled_kernel(
+    # A_sorted: [M_total, K] bf16 (all experts concatenated, sorted by expert_id)
+    a_ptr, a_stride_m, a_stride_k,
+    # B: [G, N, K_packed] uint8 packed FP4 (all experts)
+    b_ptr, b_stride_g, b_stride_n, b_stride_k,
+    # B scale: [G, N, K_scale] uint8 E8M0
+    bs_ptr, bs_stride_g, bs_stride_n, bs_stride_k,
+    # D_sorted: [M_total, N] bf16 output
+    d_ptr, d_stride_m, d_stride_n,
+    # Segment metadata
+    seg_expert_ids_ptr,  # [n_segs] int32: expert id for each segment
+    seg_starts_ptr,      # [n_segs] int32: start row in A_sorted for each segment
+    seg_counts_ptr,      # [n_segs] int32: number of rows in each segment
+    N, K: tl.constexpr,
+    K_PACKED: tl.constexpr,
+    K_SCALE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Grouped dot_scaled: one kernel launch processes all experts.
+
+    Grid: (ceil(max_M/BLOCK_M), ceil(N/BLOCK_N), n_segs)
+    program_id(2) = segment index (which expert)
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    seg_id = tl.program_id(2)
+
+    # Load segment metadata
+    expert_id = tl.load(seg_expert_ids_ptr + seg_id)
+    seg_start = tl.load(seg_starts_ptr + seg_id)
+    seg_count = tl.load(seg_counts_ptr + seg_id)
+
+    # Skip if this M-block is beyond this segment's rows
+    m_base = pid_m * BLOCK_M
+    if m_base >= seg_count:
+        return
+
+    # Global row offsets in A_sorted / D_sorted
+    m_offs = seg_start + m_base + tl.arange(0, BLOCK_M)
+    n_offs = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    m_mask = (m_base + tl.arange(0, BLOCK_M)) < seg_count
+    n_mask = n_offs < N
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    CHUNK_K: tl.constexpr = 32
+    CHUNK_K_PACKED: tl.constexpr = 16
+
+    for k_start in range(0, K, CHUNK_K):
+        k_offs = k_start + tl.arange(0, CHUNK_K)
+        kp_start = k_start // 2
+        kp_offs = kp_start + tl.arange(0, CHUNK_K_PACKED)
+
+        # A: [BLOCK_M, 32] bf16 from A_sorted
+        a_bf16 = tl.load(
+            a_ptr + m_offs[:, None] * a_stride_m + k_offs[None, :] * a_stride_k,
+            mask=m_mask[:, None] & (k_offs[None, :] < K), other=0.0
+        )
+        a_fp8 = a_bf16.to(tl.float8e4nv)
+
+        # B: [CHUNK_K_PACKED, BLOCK_N] from B[expert_id]
+        b_chunk = tl.load(
+            b_ptr + expert_id * b_stride_g + n_offs[None, :] * b_stride_n + kp_offs[:, None] * b_stride_k,
+            mask=(kp_offs[:, None] < K_PACKED) & n_mask[None, :], other=0
+        )
+
+        # Scales
+        scale_idx = k_start // 32
+        a_sc = tl.full((BLOCK_M, 1), 127, dtype=tl.uint8)
+        b_sc_val = tl.load(
+            bs_ptr + expert_id * bs_stride_g + n_offs * bs_stride_n + scale_idx * bs_stride_k,
+            mask=n_mask & (scale_idx < K_SCALE), other=127
+        )
+        b_sc = b_sc_val[:, None]
+
+        acc += tl.dot_scaled(a_fp8, a_sc, "e4m3", b_chunk, b_sc, "e2m1")
+
+    # Store to D_sorted
+    tl.store(
+        d_ptr + m_offs[:, None] * d_stride_m + n_offs[None, :] * d_stride_n,
+        acc.to(tl.bfloat16),
+        mask=m_mask[:, None] & n_mask[None, :]
+    )
+
+
 def triton_fused_fp4_matmul_nt(a_bf16, b_packed, b_scale_u8, out, use_fp8=True):
     """Fused FP4 dequant + matmul: D = A @ dequant(B)^T.
 
@@ -512,8 +599,11 @@ def m_grouped_fp8_fp4_gemm_nt_contiguous_triton(a, b, d, m_indices=None, **kwarg
     if b_tensor.dtype == torch.int8:
         b_tensor = b_tensor.view(torch.uint8)
 
-    from .gemm import _dequant_fp8_block
-    if a_scale is not None:
+    # Skip FP8 dequant if activation is already BF16/FP32
+    if a_tensor.dtype in (torch.bfloat16, torch.float32, torch.float16):
+        a_deq = a_tensor.to(torch.bfloat16)
+    elif a_scale is not None:
+        from .gemm import _dequant_fp8_block
         a_deq = _dequant_fp8_block(a_tensor, a_scale)
     else:
         a_deq = a_tensor.to(torch.bfloat16)
@@ -569,20 +659,17 @@ def m_grouped_fp8_fp4_gemm_nt_contiguous_triton(a, b, d, m_indices=None, **kwarg
     # Gather all sorted A rows at once (one index_select, not 6)
     a_sorted = a_deq.index_select(0, valid_sort_indices)
 
-    # Process all experts with minimal Python overhead
+    # Process all experts — minimal Python overhead per launch
     d.zero_()
-    d_sorted = torch.empty(n_valid_int, b_tensor.shape[1], dtype=d.dtype, device=d.device)
+    N_out = b_tensor.shape[1]
+    d_sorted = torch.empty(n_valid_int, N_out, dtype=d.dtype, device=d.device)
 
     for i in range(n_segs):
         gid = expert_ids_at_starts[i].item()
         start = seg_starts_cpu[i].item()
         end = seg_starts_cpu[i + 1].item() if i + 1 < n_segs else n_valid_int
-
         gs = b_scale_u8[gid] if (b_scale_u8 is not None and b_scale_u8.dim() == 3) else b_scale_u8
-        a_group = a_sorted[start:end]  # slice, no copy
-
-        result_slice = d_sorted[start:end]
-        triton_fused_fp4_matmul_nt(a_group, b_tensor[gid], gs, result_slice)
+        triton_fused_fp4_matmul_nt(a_sorted[start:end], b_tensor[gid], gs, d_sorted[start:end])
 
     # Scatter results back in one op
     d.index_copy_(0, valid_sort_indices, d_sorted)

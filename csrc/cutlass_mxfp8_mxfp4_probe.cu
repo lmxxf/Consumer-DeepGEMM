@@ -44,6 +44,7 @@ constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
 using ElementAccumulator = float;
 using ArchTag = cutlass::arch::Sm120;
 using OperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;
+// Keep 128x128 — 64x128 needs CUTLASS v4.4.2+ (version mismatch with DeepGEMM's bundled CUTLASS)
 using ThreadBlockShape = Shape<_128, _128, _128>;
 using ClusterShape = Shape<_1, _1, _1>;
 

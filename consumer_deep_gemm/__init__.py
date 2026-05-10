@@ -59,7 +59,7 @@ __version__ = '0.1.0'
 # to print summary every N calls (default 100)
 # ============================================================
 
-if os.environ.get("CDG_PROFILE", "1") == "1":
+if os.environ.get("CDG_PROFILE", "0") == "1":
     import functools
     from collections import defaultdict
 

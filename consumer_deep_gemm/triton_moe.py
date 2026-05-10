@@ -659,7 +659,7 @@ def m_grouped_fp8_fp4_gemm_nt_contiguous_triton(a, b, d, m_indices=None, **kwarg
     # Gather all sorted A rows at once (one index_select, not 6)
     a_sorted = a_deq.index_select(0, valid_sort_indices)
 
-    # Process all experts — minimal Python overhead per launch
+    # Process all experts — simple loop (multi-stream tested but no gain in vLLM)
     d.zero_()
     N_out = b_tensor.shape[1]
     d_sorted = torch.empty(n_valid_int, N_out, dtype=d.dtype, device=d.device)

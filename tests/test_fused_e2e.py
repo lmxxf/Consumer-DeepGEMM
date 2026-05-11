@@ -2,7 +2,9 @@
 import torch
 import time
 import sys
-sys.path.insert(0, '/root/.cache/huggingface/Consumer-DeepGEMM')
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from consumer_deep_gemm.gemm import _dequant_fp8_block, _e8m0_to_float
 from consumer_deep_gemm.triton_moe import (
     triton_dequant_fp4, triton_fused_fp4_matmul_nt,
@@ -65,7 +67,7 @@ for label, M_sum, K, N in [("FC1", 384, 7168, 4096), ("FC2", 384, 2048, 7168)]:
         m_grouped_fp8_fp4_gemm_nt_contiguous_triton(a_tuple, b_tuple, d_out, m_indices)
         fused_grouped_gemm(a_deq, b_packed, b_scale_u8, m_indices, d_out, K)
 
-    # Current: Triton dequant + mm loop
+    # Current default path.
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     for _ in range(N_ITER):
@@ -73,7 +75,7 @@ for label, M_sum, K, N in [("FC1", 384, 7168, 4096), ("FC2", 384, 2048, 7168)]:
         torch.cuda.synchronize()
     t_current = (time.perf_counter() - t0) / N_ITER
 
-    # Fused: dequant+matmul in one kernel per expert
+    # Baseline: explicit one fused dequant+matmul kernel per active expert.
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     for _ in range(N_ITER):
@@ -82,7 +84,7 @@ for label, M_sum, K, N in [("FC1", 384, 7168, 4096), ("FC2", 384, 2048, 7168)]:
     t_fused = (time.perf_counter() - t0) / N_ITER
 
     print(f"{label} [M={M_sum}, K={K}, N={N}]:")
-    print(f"  Current (dequant+mm): {t_current*1000:.2f} ms")
-    print(f"  Fused kernel:         {t_fused*1000:.2f} ms")
-    print(f"  Speedup:              {t_current/t_fused:.2f}x")
+    print(f"  Current default:      {t_current*1000:.2f} ms")
+    print(f"  Explicit baseline:    {t_fused*1000:.2f} ms")
+    print(f"  Current/baseline:     {t_fused/t_current:.2f}x")
     print()

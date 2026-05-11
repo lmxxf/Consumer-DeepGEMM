@@ -4,6 +4,8 @@ Replaces the Python fallback in gemm.py with Triton kernels that
 eliminate per-expert Python loop overhead and temporary tensor allocation.
 """
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -564,6 +566,45 @@ def triton_fused_fp4_matmul_nt(a_bf16, b_packed, b_scale_u8, out, use_fp8=True):
     )
 
 
+def triton_grouped_fused_fp4_matmul_nt(
+    a_sorted: torch.Tensor,
+    b_packed: torch.Tensor,
+    b_scale_u8: torch.Tensor,
+    d_sorted: torch.Tensor,
+    seg_expert_ids: torch.Tensor,
+    seg_starts: torch.Tensor,
+    seg_counts: torch.Tensor,
+):
+    """One-launch grouped FP8/BF16 x FP4 MoE matmul for sorted rows.
+
+    ``a_sorted`` and ``d_sorted`` contain only valid rows, sorted by expert id.
+    Segment tensors describe each contiguous expert slice.
+    """
+    if a_sorted.numel() == 0 or seg_expert_ids.numel() == 0:
+        return
+
+    _, k = a_sorted.shape
+    n = b_packed.shape[1]
+    k_packed = k // 2
+    k_scale = k // 32
+    n_segs = int(seg_expert_ids.numel())
+    max_seg_m = int(seg_counts.max().item())
+
+    block_m = min(64, triton.next_power_of_2(max_seg_m))
+    block_n = 32
+    grid = (triton.cdiv(max_seg_m, block_m), triton.cdiv(n, block_n), n_segs)
+
+    _grouped_dot_scaled_kernel[grid](
+        a_sorted, a_sorted.stride(0), a_sorted.stride(1),
+        b_packed, b_packed.stride(0), b_packed.stride(1), b_packed.stride(2),
+        b_scale_u8, b_scale_u8.stride(0), b_scale_u8.stride(1), b_scale_u8.stride(2),
+        d_sorted, d_sorted.stride(0), d_sorted.stride(1),
+        seg_expert_ids, seg_starts, seg_counts,
+        n, k, k_packed, k_scale,
+        BLOCK_M=block_m, BLOCK_N=block_n,
+    )
+
+
 _e8m0_cache = {}
 
 
@@ -635,7 +676,8 @@ def m_grouped_fp8_fp4_gemm_nt_contiguous_triton(a, b, d, m_indices=None, **kwarg
     valid_mask = sorted_indices >= 0
     n_valid = valid_mask.sum()  # this is a GPU tensor, no sync yet
 
-    if n_valid.item() == 0:  # single sync, unavoidable
+    n_valid_int = int(n_valid.item())  # single sync, unavoidable
+    if n_valid_int == 0:
         d.zero_()
         return
 
@@ -644,32 +686,52 @@ def m_grouped_fp8_fp4_gemm_nt_contiguous_triton(a, b, d, m_indices=None, **kwarg
     valid_expert_ids = sorted_indices[valid_mask]
 
     # Find segment boundaries: where expert ID changes
-    changes = torch.zeros(n_valid, dtype=torch.bool, device=d.device)
+    changes = torch.zeros(n_valid_int, dtype=torch.bool, device=d.device)
     changes[0] = True
-    if n_valid > 1:
+    if n_valid_int > 1:
         changes[1:] = valid_expert_ids[1:] != valid_expert_ids[:-1]
     seg_starts = changes.nonzero(as_tuple=False).flatten()
-
-    # Get expert IDs and row counts per segment — single CPU transfer
-    seg_starts_cpu = seg_starts.cpu()
-    expert_ids_at_starts = valid_expert_ids[seg_starts].cpu()
-    n_segs = seg_starts_cpu.numel()
-    n_valid_int = n_valid.item()
 
     # Gather all sorted A rows at once (one index_select, not 6)
     a_sorted = a_deq.index_select(0, valid_sort_indices)
 
-    # Process all experts — simple loop (multi-stream tested but no gain in vLLM)
     d.zero_()
     N_out = b_tensor.shape[1]
     d_sorted = torch.empty(n_valid_int, N_out, dtype=d.dtype, device=d.device)
 
-    for i in range(n_segs):
-        gid = expert_ids_at_starts[i].item()
-        start = seg_starts_cpu[i].item()
-        end = seg_starts_cpu[i + 1].item() if i + 1 < n_segs else n_valid_int
-        gs = b_scale_u8[gid] if (b_scale_u8 is not None and b_scale_u8.dim() == 3) else b_scale_u8
-        triton_fused_fp4_matmul_nt(a_sorted[start:end], b_tensor[gid], gs, d_sorted[start:end])
+    use_grouped_launch = os.getenv("CDG_GROUPED_DOT_SCALED", "0") == "1"
+
+    if use_grouped_launch and b_scale_u8 is not None and b_scale_u8.dim() == 3:
+        seg_ends = torch.empty_like(seg_starts)
+        if seg_starts.numel() > 1:
+            seg_ends[:-1] = seg_starts[1:]
+        seg_ends[-1] = n_valid_int
+        seg_counts = (seg_ends - seg_starts).to(torch.int32)
+        seg_expert_ids = valid_expert_ids[seg_starts].to(torch.int32)
+        triton_grouped_fused_fp4_matmul_nt(
+            a_sorted,
+            b_tensor,
+            b_scale_u8,
+            d_sorted,
+            seg_expert_ids,
+            seg_starts.to(torch.int32),
+            seg_counts,
+        )
+    else:
+        # Default path. A one-launch grouped kernel is available behind
+        # CDG_GROUPED_DOT_SCALED=1, but vLLM end-to-end testing showed it is
+        # slower than per-expert launches despite a standalone microbenchmark
+        # win, because metadata/padding/3D-grid costs dominate in service.
+        seg_starts_cpu = seg_starts.cpu()
+        expert_ids_at_starts = valid_expert_ids[seg_starts].cpu()
+        n_segs = seg_starts_cpu.numel()
+        for i in range(n_segs):
+            gid = expert_ids_at_starts[i].item()
+            start = seg_starts_cpu[i].item()
+            end = seg_starts_cpu[i + 1].item() if i + 1 < n_segs else n_valid_int
+            gs = b_scale_u8[gid] if (b_scale_u8 is not None and b_scale_u8.dim() == 3) else b_scale_u8
+            triton_fused_fp4_matmul_nt(
+                a_sorted[start:end], b_tensor[gid], gs, d_sorted[start:end])
 
     # Scatter results back in one op
     d.index_copy_(0, valid_sort_indices, d_sorted)
